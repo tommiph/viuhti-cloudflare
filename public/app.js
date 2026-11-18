@@ -1,0 +1,4488 @@
+/* Viuhti – Visual Itinerary for Ultimate Home Theater Immersion */
+(() => {
+  'use strict';
+
+  // ---------- Helpers ----------
+  const $ = (sel, root = document) => root.querySelector(sel);
+  const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
+  const esc = (s) =>
+    String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const stripHtml = (html) => {
+    const d = document.createElement('div');
+    d.innerHTML = html || '';
+    return (d.textContent || '').trim();
+  };
+  const summaryText = (html) =>
+    stripHtml(String(html || '').replace(/<br\s*\/?>/gi, '\n').replace(/<\/p>\s*<p[^>]*>/gi, '\n\n'));
+  const pad = (n) => String(n).padStart(2, '0');
+  const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const addDays = (d, n) => {
+    const x = new Date(d);
+    x.setDate(x.getDate() + n);
+    return x;
+  };
+  const startOfWeek = (d) => {
+    const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    const dow = (x.getDay() + 6) % 7; // Monday = 0
+    return addDays(x, -dow);
+  };
+  const isoWeek = (d) => {
+    const t = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+    const day = t.getUTCDay() || 7;
+    t.setUTCDate(t.getUTCDate() + 4 - day);
+    const yearStart = new Date(Date.UTC(t.getUTCFullYear(), 0, 1));
+    return Math.ceil(((t - yearStart) / 86400000 + 1) / 7);
+  };
+  const epCode = (e) => (e.season != null && e.number != null ? `S${pad(e.season)}E${pad(e.number)}` : e.season != null ? `S${pad(e.season)} Special` : 'Special');
+  const store = {
+    get: (k, def) => localStorage.getItem('viuhti.' + k) ?? def,
+    set: (k, v) => localStorage.setItem('viuhti.' + k, v),
+    getJson: (k, def) => {
+      try {
+        const raw = localStorage.getItem('viuhti.' + k);
+        return raw ? JSON.parse(raw) : def;
+      } catch {
+        return def;
+      }
+    },
+    setJson: (k, v) => localStorage.setItem('viuhti.' + k, JSON.stringify(v)),
+  };
+  const fmtTime = (date, tz) =>
+    new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', ...(tz ? { timeZone: tz } : {}) }).format(date);
+  const fmtDay = (date, opts) => new Intl.DateTimeFormat(undefined, opts).format(date);
+
+  const CLIENT_CACHE_PREFIX = 'viuhti.netcache.v1.';
+  let staleClientNoticeShown = false;
+
+  function isClientCacheableGet(path, opts) {
+    const method = String(opts?.method || 'GET').toUpperCase();
+    if (method !== 'GET') return false;
+    return /^\/api\/(shows|movies|status|schedule|discover|galaxy)(\?|$)/.test(path);
+  }
+
+  function readClientCache(path) {
+    try {
+      const raw = localStorage.getItem(CLIENT_CACHE_PREFIX + path);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      return parsed && parsed.data !== undefined ? parsed.data : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function writeClientCache(path, data) {
+    try {
+      const json = JSON.stringify({ at: Date.now(), data });
+      if (json.length > 420_000) return;
+      localStorage.setItem(CLIENT_CACHE_PREFIX + path, json);
+    } catch {
+      try {
+        for (let i = localStorage.length - 1; i >= 0; i--) {
+          const k = localStorage.key(i);
+          if (k && k.startsWith(CLIENT_CACHE_PREFIX)) localStorage.removeItem(k);
+        }
+        localStorage.setItem(CLIENT_CACHE_PREFIX + path, JSON.stringify({ at: Date.now(), data }));
+      } catch {
+        // Ignore storage quota errors
+      }
+    }
+  }
+
+  async function api(path, opts = {}) {
+    const cacheable = isClientCacheableGet(path, opts);
+    try {
+      const res = await fetch(path, {
+        ...opts,
+        headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        if (cacheable && res.status >= 500) {
+          const fallback = readClientCache(path);
+          if (fallback !== null) {
+            if (!staleClientNoticeShown) {
+              staleClientNoticeShown = true;
+              toast('Serving local cached snapshot while D1 recovers — see /status', 'warn');
+            }
+            return fallback;
+          }
+        }
+        throw new Error(data.error || `Request failed (${res.status})`);
+      }
+      if (cacheable) writeClientCache(path, data);
+      return data;
+    } catch (err) {
+      if (cacheable) {
+        const fallback = readClientCache(path);
+        if (fallback !== null) {
+          if (!staleClientNoticeShown) {
+            staleClientNoticeShown = true;
+            toast('Serving local cached snapshot — see /status', 'warn');
+          }
+          return fallback;
+        }
+      }
+      throw err;
+    }
+  }
+
+  // ---------- Icons ----------
+  const useIcon = (id) => `<svg aria-hidden="true"><use href="#i-${id}"/></svg>`;
+  const ICON = {
+    tv: useIcon('tv'),
+    stream: useIcon('stream'),
+    physical: useIcon('physical'),
+    search: useIcon('search'),
+    ext: useIcon('ext'),
+    eyeOff: useIcon('eyeOff'),
+    eye: useIcon('eye'),
+    clock: useIcon('clock'),
+    cal: useIcon('cal'),
+    star: useIcon('star'),
+    starOutline: useIcon('starOutline'),
+    globe: useIcon('globe'),
+    close: useIcon('close'),
+    restore: useIcon('restore'),
+    check: useIcon('check'),
+    alert: useIcon('alert'),
+    tvBig: useIcon('tvBig'),
+  };
+
+  // ---------- Branding: channel / streaming colors ----------
+  const BRANDS = [
+    [/4k|uhd/, '#b45309'],
+    [/blu-?ray/, '#0284c7'],
+    [/^dvd$|physical/, '#4f46e5'],
+    [/netflix/, '#E50914'],
+    [/hbo|^max$/, '#5b2bd6'],
+    [/disney/, '#113CCF'],
+    [/apple tv/, '#1d1d1f'],
+    [/prime video|amazon/, '#00A8E1'],
+    [/hulu/, '#1CE783'],
+    [/paramount/, '#0064FF'],
+    [/peacock/, '#2b2b2b'],
+    [/showtime/, '#B10000'],
+    [/starz/, '#111111'],
+    [/crunchyroll/, '#F47521'],
+    [/youtube/, '#FF0000'],
+    [/^bbc/, '#b0151d'],
+    [/^itv/, '#16a394'],
+    [/channel 4|^e4$|^more4/, '#3a3fa8'],
+    [/channel 5|^5$/, '#d6006f'],
+    [/^sky/, '#0b6bd3'],
+    [/^cbs/, '#0a3d91'],
+    [/^nbc/, '#e8660d'],
+    [/^abc/, '#2f2f2f'],
+    [/^fox/, '#00315f'],
+    [/^the cw|^cw$/, '#22884a'],
+    [/^amc/, '#2b2b2b'],
+    [/^fx/, '#1a1a1a'],
+    [/^tnt/, '#d81e26'],
+    [/^tbs/, '#2f5fb3'],
+    [/comedy central/, '#f5c800'],
+    [/bravo/, '#6b2b8a'],
+    [/^e!$/, '#e4004b'],
+    [/syfy/, '#6e1a8a'],
+    [/discovery/, '#0a62c4'],
+    [/history/, '#b5121b'],
+    [/mgm/, '#a8781f'],
+    [/^cbc/, '#d40000'],
+    [/^ctv/, '#0055a5'],
+    [/citytv/, '#c8102e'],
+    [/global/, '#1c3f94'],
+    [/tvn/, '#e4002b'],
+    [/^jtbc/, '#7a3cd1'],
+    [/^kbs/, '#004ea2'],
+    [/^sbs/, '#1b57b6'],
+    [/^mbc/, '#2d8ae6'],
+    [/^ten$|network 10/, '#0f0f0f'],
+    [/^nine/, '#0096d6'],
+    [/^seven/, '#e30613'],
+    [/^tf1/, '#0058a8'],
+    [/canal\+/, '#111111'],
+    [/^france/, '#2b46b8'],
+    [/viaplay/, '#0c1d3a'],
+    [/^yle/, '#1d9ccf'],
+    [/^svt/, '#0d6e3d'],
+    [/^nrk/, '#d1191f'],
+    [/^dr/, '#c9061c'],
+  ];
+  function brandColor(name) {
+    const n = String(name || '').toLowerCase().trim();
+    for (const [re, c] of BRANDS) if (re.test(n)) return c;
+    let h = 0;
+    for (const ch of n) h = (h * 31 + ch.charCodeAt(0)) % 360;
+    return `hsl(${h} 50% 38%)`;
+  }
+  function textOn(color) {
+    if (!color.startsWith('#')) return '#fff';
+    const r = parseInt(color.slice(1, 3), 16), g = parseInt(color.slice(3, 5), 16), b = parseInt(color.slice(5, 7), 16);
+    return 0.299 * r + 0.587 * g + 0.114 * b > 165 ? '#111' : '#fff';
+  }
+  /** Primary source of a show or movie: TV channel or streaming service. */
+  function sourceOf(item) {
+    if (!item) return { kind: 'tv', name: 'Unknown' };
+    if (item.kind === 'movie') {
+      return { kind: item.releaseKind || 'stream', name: item.channelName || 'Digital', country: item.channelCountry || null, tz: null };
+    }
+    if (item.network) return { kind: 'tv', name: item.network.name, country: item.network.country, tz: item.network.timezone };
+    if (item.webChannel) return { kind: 'stream', name: item.webChannel.name, country: item.webChannel.country, tz: item.webChannel.timezone };
+    return { kind: 'tv', name: 'Unknown' };
+  }
+  function srcBadge(name, kind, extraClass = '') {
+    const bg = brandColor(name);
+    const tip = kind === 'stream' ? 'Streaming / Digital on' : kind === 'physical' ? 'Physical media:' : 'Airs on';
+    return `<span class="src ${extraClass}" style="--src-bg:${bg};--src-fg:${textOn(bg)}" title="${tip} ${esc(name)}">${ICON[kind] || ICON.stream}<span>${esc(name)}</span></span>`;
+  }
+
+  // ---------- External Search link ----------
+  const extSearchQuery = (itemOrName, ep = null) => {
+    const isObj = itemOrName && typeof itemOrName === 'object';
+    const rawName = isObj ? itemOrName.extQuery || itemOrName.name : itemOrName;
+    const isCustom = isObj && Boolean(itemOrName.extQuery);
+    const base = isCustom
+      ? String(rawName).trim()
+      : String(rawName).replace(/['’`]/g, '').replace(/:/g, ' ').replace(/\s+/g, ' ').trim();
+    const parts = [base];
+    if (isObj && itemOrName.kind === 'movie') {
+      const yr = (itemOrName.premiered || itemOrName.airdate || '').slice(0, 4);
+      if (yr && !isCustom) parts.push(yr);
+    } else if (ep && ep.season != null && ep.number != null) {
+      parts.push(`S${pad(ep.season)}E${pad(ep.number)}`);
+    } else if (ep && ep.season != null) {
+      parts.push(`S${pad(ep.season)}`);
+    }
+    return parts.join(' ').trim();
+  };
+  const extSearchUrl = (itemOrName, ep = null) => {
+    const tpl = (state.settings && state.settings.extSearchUrl) || '';
+    if (!tpl) return null;
+    const q = encodeURIComponent(extSearchQuery(itemOrName, ep));
+    return /\{query\}|\{q\}/i.test(tpl) ? tpl.replace(/\{query\}|\{q\}/gi, q) : `${tpl}${q}`;
+  };
+  const extSearchBtnHtml = (item, ep = null, mini = false) => {
+    const url = extSearchUrl(item, ep);
+    if (!url) return '';
+    const title = `External Search: "${extSearchQuery(item, ep)}"`;
+    if (mini) return `<a class="mini-btn" href="${esc(url)}" target="_blank" rel="noopener noreferrer" title="${esc(title)}">${ICON.search}</a>`;
+    return `<a class="ext-btn" href="${esc(url)}" target="_blank" rel="noopener noreferrer" title="${esc(title)}" data-stop>${ICON.search}<span>Ext</span></a>`;
+  };
+
+  // ---------- State ----------
+  const VALID_DENSITIES = new Set(['day', 'cards', 'compact', 'month', 'agenda']);
+  const rawDensity = store.get('density', 'cards');
+  const state = {
+    weekStart: startOfWeek(new Date()),
+    focusDate: ymd(new Date()),
+    shows: new Map(),
+    movies: new Map(),
+    hiddenItems: [],
+    episodes: [],
+    movieEvents: [],
+    groups: new Map(), // key -> group (for modal lookup)
+    media: store.get('media', 'shows'), // 'shows' | 'both' | 'movies'
+    drawerMedia: 'wordpool', // 'wordpool' | 'appearance' | 'sync' | 'alerts' | 'feeds' | 'hidden'
+    wordpool: {
+      entries: [],
+      stats: { total: 0, active: 0, primary: 0, fuzzy: 0, exclude: 0 },
+      suggestions: [],
+      loaded: false,
+    },
+    filter: store.get('filter', 'all'),
+    genre: store.get('genre', ''),
+    channel: store.get('channel', ''),
+    favoritesOnly: store.get('favOnly', '0') === '1',
+    hideWatched: store.get('hideWatched', '0') === '1',
+    timeMode: store.get('timeMode', 'local'),
+    density: VALID_DENSITIES.has(rawDensity) ? rawDensity : 'cards',
+    tab: ['discover', 'graxobolt'].includes(store.get('tab', 'calendar')) ? store.get('tab', 'calendar') : 'calendar',
+    digestExpanded: false,
+    discover: {
+      media: store.get('discMedia', 'all'),
+      lens: store.get('discLens', 'mix'),
+      anchor: '',
+      studioOpen: false,
+      tunerOpen: false,
+      data: null,
+      loading: false,
+      autoStarted: false,
+      wasRunning: false,
+    },
+    settings: {
+      extSearchUrl: store.get('extSearchUrl', ''),
+      interests: Array.isArray(store.getJson('interests', [])) ? store.getJson('interests', []) : [],
+      showHidden: store.get('showHidden', '0') === '1',
+      hideWatched: store.get('hideWatched', '0') === '1',
+      notifyBrowser: store.get('notifyBrowser', '0') === '1',
+      webhookUrl: '',
+      style: store.get('style', 'midnight'),
+      apiKeys: { tmdb: false, tmdbHint: '', tvmaze: false, tvmazeHint: '' },
+    },
+    status: null,
+    showsLoaded: false,
+    loaded: false,
+  };
+
+  const THEMES = [
+    { id: 'midnight', name: 'Midnight', mode: 'Dark', motif: 'Neon glass', swatches: ['#07080f', '#141730', '#8b5cf6', '#ec4899'] },
+    { id: 'bistro', name: 'Grand Bistro', mode: 'Light', motif: 'Restaurant menu', swatches: ['#f6efe0', '#fcf8ee', '#7a1826', '#9b6b1e'] },
+    { id: 'airport', name: 'Departure Board', mode: 'Dark', motif: 'Airport terminal', swatches: ['#0a0b0e', '#151820', '#ffb000', '#c8ff3d'] },
+    { id: 'cinema', name: 'Silver Screen', mode: 'Dark', motif: 'Movies & Art Deco', swatches: ['#0e0407', '#210912', '#e5be63', '#be123c'] },
+    { id: 'newspaper', name: 'Broadsheet', mode: 'Light', motif: 'Editorial print', swatches: ['#f1ede4', '#f7f4ec', '#141414', '#b91c1c'] },
+    { id: 'blueprint', name: 'Blueprint', mode: 'Dark', motif: 'Drafting table', swatches: ['#052142', '#093060', '#38bdf8', '#fde047'] },
+    { id: 'swiss', name: 'Swiss Atelier', mode: 'Light', motif: 'Sophisticated grid', swatches: ['#f4f3ee', '#ffffff', '#e12d1a', '#111111'] },
+    { id: 'cyber', name: 'Cyber Arcade', mode: 'Dark', motif: 'Neon CRT terminal', swatches: ['#04010c', '#0d0522', '#00f5d4', '#ff2a85'] },
+    { id: 'botanical', name: 'Greenhouse', mode: 'Light', motif: 'Botanical garden', swatches: ['#ecf3ea', '#fafdf9', '#276749', '#c25e39'] },
+    { id: 'popart', name: 'Comic Press', mode: 'Light', motif: 'Halftone pop art', swatches: ['#fffbef', '#ffffff', '#facc15', '#f43f5e'] },
+  ];
+  const VALID_THEME_IDS = new Set(THEMES.map((t) => t.id));
+  let themeSaveInflight = 0;
+  let gbController = null;
+  function normalizeTheme(id) {
+    const k = String(id || '').trim().toLowerCase();
+    return VALID_THEME_IDS.has(k) ? k : 'midnight';
+  }
+  function applyTheme(id) {
+    const next = normalizeTheme(id);
+    document.documentElement.dataset.theme = next;
+    store.set('style', next);
+    if (gbController) gbController.refreshTheme();
+    return next;
+  }
+  function syncSettingsFromServer(nextSettings, _alwaysApplyTheme = false) {
+    if (!nextSettings) return;
+    // Server owns shared keys/webhook/installDate; browser localStorage owns all UI customizations.
+    state.settings = {
+      ...state.settings,
+      ...(nextSettings.webhookUrl !== undefined ? { webhookUrl: nextSettings.webhookUrl } : {}),
+      ...(nextSettings.installDate !== undefined ? { installDate: nextSettings.installDate } : {}),
+      ...(nextSettings.apiKeys
+        ? { apiKeys: nextSettings.apiKeys }
+        : nextSettings.tmdbKeySet !== undefined
+        ? {
+            apiKeys: {
+              tmdb: Boolean(nextSettings.tmdbKeySet),
+              tmdbHint: nextSettings.tmdbKeyMask || '',
+              tvmaze: Boolean(nextSettings.tvmazeKeySet),
+              tvmazeHint: nextSettings.tvmazeKeyMask || '',
+            },
+          }
+        : {}),
+    };
+    updateWatchedFilterUi();
+  }
+  applyTheme(state.settings.style);
+
+  // ---------- Data loading ----------
+  function updateWordPoolCounters() {
+    const active = (state.wordpool && state.wordpool.stats && state.wordpool.stats.active) || 0;
+    for (const sel of ['#topWpCount', '#ccWpCount']) {
+      const el = $(sel);
+      if (!el) continue;
+      el.textContent = active;
+      el.hidden = active === 0;
+    }
+  }
+
+  let rawServerShows = [];
+  let rawServerMovies = [];
+  let rawServerEpisodes = [];
+  let rawServerMovieEvents = [];
+  let rawDiscoverData = null;
+  let publicServerShowIds = new Set();
+  let publicServerMovieIds = new Set();
+
+  function applyClientWordPoolAndLibrary() {
+    const entries = window.ViuhtiClient.getWordPoolEntries();
+    const stats = window.ViuhtiClient.computeWordPoolStats(entries);
+    const incHid = Boolean(state.settings && state.settings.showHidden);
+    const cat = window.ViuhtiClient.applyToCatalog(rawServerShows, rawServerMovies, incHid);
+    state.shows = new Map(cat.shows.map((s) => [s.id, s]));
+    state.movies = new Map(cat.movies.map((m) => [m.id, m]));
+    state.hiddenItems = cat.hiddenItems || [];
+    state.wordpool = {
+      entries,
+      stats,
+      suggestions: window.ViuhtiClient.suggestWordPool(entries, cat.shows, cat.movies, 16),
+      loaded: true,
+    };
+    updateWordPoolCounters();
+    $('#movieCount').textContent = cat.movies.filter((m) => !m.hidden).length;
+    updateFavUi();
+    updateWatchedFilterUi();
+    updateHiddenUi();
+    populateGenres();
+    populateChannels();
+  }
+
+  function loadWordPool(suggest = true) {
+    const entries = window.ViuhtiClient.getWordPoolEntries();
+    const stats = window.ViuhtiClient.computeWordPoolStats(entries);
+    state.wordpool = {
+      entries,
+      stats,
+      suggestions: suggest ? window.ViuhtiClient.suggestWordPool(entries, [...state.shows.values()], [...state.movies.values()], 16) : [],
+      loaded: true,
+    };
+    updateWordPoolCounters();
+    if ($('#drawer').classList.contains('open')) renderWordPoolSettings();
+  }
+
+  function updateHiddenUi() {
+    const n = state.hiddenItems.length;
+    for (const sel of ['#topHiddenCount', '#drawerHiddenCount']) {
+      const el = $(sel);
+      if (!el) continue;
+      el.textContent = n;
+      el.hidden = n === 0;
+    }
+    updateWordPoolCounters();
+    const bar = $('#hiddenBar');
+    if (bar) bar.hidden = state.drawerMedia !== 'hidden';
+    const sum = $('#hiddenSummary');
+    if (sum) sum.textContent = n ? `${n} hidden item${n === 1 ? '' : 's'} · Never auto-added by updates` : 'No hidden items';
+  }
+
+  function refreshHidden() {
+    applyClientWordPoolAndLibrary();
+    if ($('#drawer').classList.contains('open')) {
+      renderHiddenSettings(state.settings);
+      if (state.drawerMedia === 'hidden') renderHiddenDrawer();
+    }
+  }
+
+  async function loadShows() {
+    const [showList, movieList] = await Promise.all([api('/api/shows'), api('/api/movies')]);
+    rawServerShows = showList || [];
+    rawServerMovies = movieList || [];
+    const lib = window.ViuhtiClient.getLib();
+    const haveS = new Set(rawServerShows.map((s) => Number(s.id)));
+    const haveM = new Set(rawServerMovies.map((m) => Number(m.id)));
+    publicServerShowIds = haveS;
+    publicServerMovieIds = haveM;
+    const needS = Object.keys(lib.addedShows || {}).map(Number).filter((id) => id && !haveS.has(id) && !lib.hiddenShows[String(id)]);
+    const needM = Object.keys(lib.addedMovies || {}).map(Number).filter((id) => id && !haveM.has(id) && !lib.hiddenMovies[String(id)]);
+    if (needS.length || needM.length) {
+      const hyd = await api('/api/catalog/hydrate', { method: 'POST', body: JSON.stringify({ showIds: needS, movieIds: needM }) }).catch(() => null);
+      if (hyd && Array.isArray(hyd.shows)) rawServerShows.push(...hyd.shows);
+      if (hyd && Array.isArray(hyd.movies)) rawServerMovies.push(...hyd.movies);
+    }
+    applyClientWordPoolAndLibrary();
+    state.showsLoaded = true;
+    if ($('#drawer').classList.contains('open')) {
+      renderInterestsSettings();
+      renderHiddenSettings(state.settings);
+      renderWordPoolSettings();
+    }
+    renderHiddenDrawer();
+    if (state.loaded) renderCalendar(true);
+  }
+
+  function activeCollections() {
+    if (state.media === 'movies') return [state.movies];
+    if (state.media === 'both') return [state.shows, state.movies];
+    return [state.shows];
+  }
+
+  function updateFavUi() {
+    let favCount = 0;
+    for (const col of activeCollections()) {
+      for (const s of col.values()) if (s.favorite && !s.hidden) favCount++;
+    }
+    $('#favCount').textContent = favCount;
+    const btn = $('#favFilterBtn');
+    btn.classList.toggle('on', state.favoritesOnly);
+    btn.setAttribute('aria-pressed', String(state.favoritesOnly));
+  }
+
+  function populateGenres() {
+    const counts = new Map();
+    for (const col of activeCollections()) {
+      for (const s of col.values()) {
+        for (const g of s.genres || []) counts.set(g, (counts.get(g) || 0) + 1);
+      }
+    }
+    const genres = [...counts.keys()].sort((a, b) => a.localeCompare(b));
+    if (state.genre && !counts.has(state.genre)) {
+      state.genre = '';
+      store.set('genre', '');
+    }
+    const sel = $('#genreFilter');
+    sel.innerHTML =
+      '<option value="">All genres</option>' +
+      genres.map((g) => `<option value="${esc(g)}">${esc(g)} (${counts.get(g)})</option>`).join('');
+    sel.value = state.genre;
+    $('#genreWrap').classList.toggle('active', Boolean(state.genre));
+  }
+
+  function populateChannels() {
+    const counts = new Map();
+    for (const col of activeCollections()) {
+      for (const s of col.values()) {
+        const name = sourceOf(s).name;
+        if (name && name !== 'Unknown') counts.set(name, (counts.get(name) || 0) + 1);
+      }
+    }
+    const channels = [...counts.keys()].sort((a, b) => (counts.get(b) - counts.get(a)) || a.localeCompare(b));
+    if (state.channel && !counts.has(state.channel)) {
+      state.channel = '';
+      store.set('channel', '');
+    }
+    const sel = $('#channelFilter');
+    if (!sel) return;
+    sel.innerHTML =
+      '<option value="">All services</option>' +
+      channels.map((c) => `<option value="${esc(c)}">${esc(c)} (${counts.get(c)})</option>`).join('');
+    sel.value = state.channel;
+    $('#channelWrap')?.classList.toggle('active', Boolean(state.channel));
+  }
+
+  function updateWatchedFilterUi() {
+    const btn = $('#watchedFilterBtn');
+    if (!btn) return;
+    btn.classList.toggle('on', state.hideWatched);
+    btn.setAttribute('aria-pressed', String(state.hideWatched));
+  }
+
+  function viewRange() {
+    if (state.density === 'day') {
+      const d = new Date(state.focusDate + 'T12:00:00');
+      return { start: d, end: d, fetchFrom: ymd(addDays(d, -1)), fetchTo: ymd(addDays(d, 1)), summaries: true };
+    }
+    if (state.density === 'month') {
+      const d = new Date(state.focusDate + 'T12:00:00');
+      const first = new Date(d.getFullYear(), d.getMonth(), 1);
+      const last = new Date(d.getFullYear(), d.getMonth() + 1, 0);
+      const start = startOfWeek(first);
+      const end = addDays(startOfWeek(last), 6);
+      return { start, end, month: d.getMonth(), year: d.getFullYear(), fetchFrom: ymd(addDays(start, -1)), fetchTo: ymd(addDays(end, 1)), summaries: false };
+    }
+    if (state.density === 'agenda') {
+      const isCurrentWeek = ymd(state.weekStart) === ymd(startOfWeek(new Date()));
+      if (isCurrentWeek) {
+        const now = new Date();
+        const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        const end = addDays(start, 13); // rolling 14 days
+        return { start, end, fetchFrom: ymd(addDays(start, -1)), fetchTo: ymd(addDays(end, 1)), summaries: false, rollingAgenda: true };
+      }
+    }
+    const start = state.weekStart;
+    const end = addDays(start, 6);
+    return { start, end, fetchFrom: ymd(addDays(start, -1)), fetchTo: ymd(addDays(end, 1)), summaries: false, rollingAgenda: false };
+  }
+
+  let weekReq = 0;
+  async function loadWeek(scrollToday = true) {
+    const req = ++weekReq;
+    const vr = viewRange();
+    const q = `/api/schedule?from=${vr.fetchFrom}&to=${vr.fetchTo}${vr.summaries ? '&summaries=1' : ''}`;
+    const lib = window.ViuhtiClient.getLib();
+    const extraShowIds = Object.keys(lib.addedShows || {})
+      .map(Number)
+      .filter((id) => id && !publicServerShowIds.has(id) && !lib.hiddenShows[String(id)]);
+    const extraMovieIds = Object.keys(lib.addedMovies || {})
+      .map(Number)
+      .filter((id) => id && !publicServerMovieIds.has(id) && !lib.hiddenMovies[String(id)]);
+    const hydPromise =
+      extraShowIds.length || extraMovieIds.length
+        ? api('/api/catalog/hydrate', {
+            method: 'POST',
+            body: JSON.stringify({
+              showIds: extraShowIds,
+              movieIds: extraMovieIds,
+              from: vr.fetchFrom,
+              to: vr.fetchTo,
+              withSummaries: Boolean(vr.summaries),
+            }),
+          }).catch(() => null)
+        : Promise.resolve(null);
+    const [data, hyd] = await Promise.all([api(q), hydPromise]);
+    if (req !== weekReq) return;
+    const epById = new Map((data.episodes || []).map((e) => [Number(e.id), e]));
+    for (const e of (hyd && hyd.episodes) || []) {
+      if (!epById.has(Number(e.id))) epById.set(Number(e.id), e);
+    }
+    const mvById = new Map((data.movies || []).map((m) => [String(m.id), m]));
+    for (const m of (hyd && hyd.movieEvents) || []) {
+      if (!mvById.has(String(m.id))) mvById.set(String(m.id), m);
+    }
+    rawServerEpisodes = [...epById.values()];
+    rawServerMovieEvents = [...mvById.values()];
+    syncSettingsFromServer(data.settings, true);
+    const overlaid = window.ViuhtiClient.applyToSchedule(
+      rawServerEpisodes,
+      rawServerMovieEvents,
+      state.shows,
+      state.movies,
+      null,
+      vr.fetchFrom,
+      vr.fetchTo,
+      { includeHidden: Boolean(state.settings.showHidden) }
+    );
+    state.episodes = overlaid.episodes;
+    state.movieEvents = overlaid.movies;
+    state.loaded = true;
+    if (state.showsLoaded) renderCalendar(scrollToday);
+  }
+
+  const reloadAll = () => Promise.all([loadShows(), loadWeek()]).catch((e) => toast(e.message, 'err'));
+
+  // ---------- Calendar rendering ----------
+  function dayKeyOf(ep) {
+    if (state.timeMode === 'network' || !ep.airtime || !ep.airstamp) return ep.airdate;
+    return ymd(new Date(ep.airstamp));
+  }
+
+  function timeLabel(ep, show) {
+    if (!ep.airtime || !ep.airstamp) return show && show.webChannel && !show.network ? 'Streaming' : 'TBA';
+    const d = new Date(ep.airstamp);
+    if (state.timeMode === 'network') {
+      const tz = sourceOf(show).tz;
+      try {
+        return new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', timeZoneName: 'short', ...(tz ? { timeZone: tz } : {}) }).format(d);
+      } catch {
+        return ep.airtime;
+      }
+    }
+    return fmtTime(d);
+  }
+
+  function itemWordPool(item, eps = []) {
+    const base = (item && item.wordPool) || {};
+    const epHits = (eps || []).map((e) => e && e.wordPool).filter(Boolean);
+    const primaryMatches = [...(base.primaryMatches || []), ...epHits.flatMap((x) => x.primaryMatches || [])];
+    const fuzzyMatches = [...(base.fuzzyMatches || []), ...epHits.flatMap((x) => x.fuzzyMatches || [])];
+    return {
+      primary: Boolean(base.primary || epHits.some((x) => x.primary) || primaryMatches.length),
+      fuzzy: Boolean(base.fuzzy || epHits.some((x) => x.fuzzy) || fuzzyMatches.length),
+      primaryMatches,
+      fuzzyMatches,
+    };
+  }
+
+  function wpBadgesHtml(item, eps = [], compact = false) {
+    const wp = itemWordPool(item, eps);
+    const pills = [];
+    if (wp.primary) {
+      const terms = [...new Set(wp.primaryMatches.map((m) => m.term))];
+      const tip = `Primary Override* (${terms.join(', ') || 'strict match'}) — overrides Sync, Discover & Calendar filters`;
+      pills.push(`<span class="wp-badge primary" title="${esc(tip)}">${compact ? '★ Primary' : '★ Primary Override'}</span>`);
+    }
+    if (wp.fuzzy) {
+      const top = wp.fuzzyMatches[0];
+      const terms = [...new Set(wp.fuzzyMatches.map((m) => m.term))];
+      const tip = `Fuzzy Match: ${terms.join(', ')}${top && top.field ? ` in ${top.field}` : ''}${top && top.snippet ? ` — ${top.snippet}` : ''}`;
+      pills.push(`<span class="wp-badge fuzzy" title="${esc(tip)}">Fuzzy Match</span>`);
+    }
+    return pills.join('');
+  }
+
+  function matchesCalendarFilters(item, eps = []) {
+    if (!item || item.pending) return false;
+    if (itemWordPool(item, eps).primary) return true; // *Primary strict override bypasses non-hidden Calendar filters
+    const src = sourceOf(item);
+    if (state.filter === 'tv' && src.kind !== 'tv') return false;
+    if (state.filter === 'stream' && src.kind !== 'stream') return false;
+    if (state.filter === 'physical' && src.kind !== 'physical') return false;
+    if (state.genre && !(item.genres || []).includes(state.genre)) return false;
+    if (state.channel && src.name !== state.channel) return false;
+    if (state.favoritesOnly && !item.favorite) return false;
+    return true;
+  }
+
+  function buildGroups(rangeStart = state.weekStart, rangeEnd = addDays(state.weekStart, 6)) {
+    const days = new Map();
+    for (let cur = new Date(rangeStart); cur <= rangeEnd; cur = addDays(cur, 1)) {
+      days.set(ymd(cur), new Map());
+    }
+    if (state.media !== 'movies') {
+      for (const ep of state.episodes) {
+        if (state.hideWatched && ep.watched) continue;
+        const show = state.shows.get(ep.showId);
+        if (!matchesCalendarFilters(show, [ep])) continue;
+        const key = dayKeyOf(ep);
+        const day = days.get(key);
+        if (!day) continue;
+        const gk = `s:${key}:${ep.showId}`;
+        if (!day.has(gk)) day.set(gk, { key: gk, kind: 'show', day: key, show, eps: [] });
+        day.get(gk).eps.push(ep);
+      }
+    }
+    if (state.media !== 'shows') {
+      for (const ev of state.movieEvents) {
+        if (state.hideWatched && ev.watched) continue;
+        const movie = state.movies.get(ev.movieId);
+        if (!matchesCalendarFilters(movie, [ev])) continue;
+        const day = days.get(ev.airdate);
+        if (!day) continue;
+        const gk = `m:${ev.airdate}:${ev.movieId}`;
+        day.set(gk, { key: gk, kind: 'movie', day: ev.airdate, show: movie, eps: [ev] });
+      }
+    }
+    state.groups.clear();
+    const out = [];
+    for (const [key, map] of days) {
+      const groups = [...map.values()];
+      for (const g of groups) {
+        if (g.kind === 'show') g.eps.sort((a, b) => (a.season - b.season) || (a.number - b.number));
+        state.groups.set(g.key, g);
+      }
+      groups.sort((a, b) => {
+        if (a.kind !== b.kind) return a.kind === 'show' ? -1 : 1;
+        if (a.kind === 'movie') return (b.show.popularity || 0) - (a.show.popularity || 0) || a.show.name.localeCompare(b.show.name);
+        return sortStamp(a.eps[0]) - sortStamp(b.eps[0]) || a.show.name.localeCompare(b.show.name);
+      });
+      out.push({ key, groups });
+    }
+    return out;
+  }
+  const sortStamp = (ep) => (ep.airtime && ep.airstamp ? Date.parse(ep.airstamp) : Date.parse(ep.airdate + 'T00:00:00') - 1);
+
+  function artHtml(show, priority = false) {
+    const pri = priority ? 'high' : 'low';
+    if (state.density === 'compact') {
+      return show.poster ? `<img class="cposter" src="${esc(show.poster)}" alt="" fetchpriority="${pri}" decoding="async" onerror="this.style.display='none'">` : '';
+    }
+    return cardArtHtml(show, pri);
+  }
+
+  function wideArtHtml(img, alt = '', pri = 'low') {
+    return `<img class="banner" src="${esc(img)}" alt="${esc(alt)}" fetchpriority="${pri}" decoding="async" onerror="this.style.display='none'">`;
+  }
+
+  function cardArtHtml(item, pri = 'low') {
+    if (item.kind === 'movie') {
+      if (item.background && item.logo) {
+        return `<img class="movie-bg" src="${esc(item.background)}" alt="" fetchpriority="${pri}" decoding="async" onerror="this.style.display='none'"><img class="movie-logo" src="${esc(item.logo)}" alt="${esc(item.name)} logo" fetchpriority="${pri}" decoding="async" onerror="this.style.display='none'">`;
+      }
+      if (item.background) return `<img src="${esc(item.background)}" alt="" fetchpriority="${pri}" decoding="async" onerror="this.style.display='none'">`;
+      if (item.logo) return wideArtHtml(item.logo, `${item.name} logo`, pri);
+      if (item.poster) return `<img class="poster" src="${esc(item.poster)}" alt="" fetchpriority="${pri}" decoding="async" onerror="this.style.display='none'">`;
+      return '';
+    }
+    if (item.banner) return wideArtHtml(item.banner, '', pri);
+    if (item.poster) return `<img class="poster" src="${esc(item.poster)}" alt="" fetchpriority="${pri}" decoding="async" onerror="this.style.display='none'">`;
+    if (item.logo) return wideArtHtml(item.logo, `${item.name} logo`, pri);
+    return '';
+  }
+
+  function epEventBadge(ep) {
+    if (!ep) return null;
+    if (ep.premiere === 'series' || (ep.premiere == null && ep.season === 1 && ep.number === 1)) {
+      return { text: 'Series premiere', short: 'S1 Prem', cls: 'series-prem', title: 'Series premiere' };
+    }
+    if (ep.premiere === 'season' || (ep.premiere == null && ep.season > 1 && ep.number === 1)) {
+      return { text: 'Season premiere', short: 'Premiere', cls: 'season-prem', title: 'Season premiere' };
+    }
+    if (ep.finale === 'series') return { text: 'Series finale', short: 'Series fin', cls: 'series-fin', title: 'Series finale' };
+    if (ep.finale === 'season') return { text: 'Season finale', short: 'Finale', cls: 'season-fin', title: 'Season finale' };
+    if (ep.special || (ep.season != null && ep.number == null)) {
+      return { text: 'Special', short: 'Special', cls: 'special', title: 'Special episode' };
+    }
+    return null;
+  }
+
+  function groupBadges(g) {
+    const { kind, eps } = g;
+    if (kind === 'movie') {
+      return {
+        primary: { text: 'Movie', short: 'Movie', cls: 'movie', title: 'Movie release' },
+        isNew: Boolean(eps[0] && eps[0].isNew),
+      };
+    }
+    const premSeries = eps.some((e) => e.premiere === 'series' || (e.premiere == null && e.season === 1 && e.number === 1));
+    const premSeason = eps.some((e) => e.premiere === 'season' || (e.premiere == null && e.season > 1 && e.number === 1));
+    const finSeries = eps.some((e) => e.finale === 'series');
+    const finSeason = eps.some((e) => e.finale === 'season');
+    const isSpecial = eps.some((e) => e.special || (e.season != null && e.number == null));
+    const hasFin = finSeries || finSeason;
+    const isNew = eps.some((e) => e.isNew);
+    let primary = null;
+    if (premSeries) {
+      primary = {
+        text: 'Series premiere',
+        short: 'S1 Prem',
+        cls: 'series-prem',
+        title: hasFin && eps.length > 1 ? 'Series premiere (full season drop)' : 'Brand-new series premiere',
+      };
+    } else if (premSeason) {
+      primary = {
+        text: 'Season premiere',
+        short: 'Premiere',
+        cls: 'season-prem',
+        title: hasFin && eps.length > 1 ? 'Season premiere (full season drop)' : 'Season premiere',
+      };
+    } else if (finSeries) {
+      primary = { text: 'Series finale', short: 'Series fin', cls: 'series-fin', title: 'Series finale' };
+    } else if (finSeason) {
+      primary = { text: 'Season finale', short: 'Finale', cls: 'season-fin', title: 'Season finale' };
+    } else if (isSpecial) {
+      primary = { text: 'Special', short: 'Special', cls: 'special', title: 'Special episode' };
+    } else if (isNew) {
+      primary = { text: 'New', short: 'New', cls: 'new', title: 'New series in its debut run' };
+    }
+    return { primary, isNew: !premSeries && primary?.cls !== 'new' && isNew };
+  }
+
+  function interestSet() {
+    return new Set((state.settings && state.settings.interests) || []);
+  }
+
+  function matchedInterests(item) {
+    if (!item || !item.genres || !item.genres.length) return [];
+    const set = interestSet();
+    if (!set.size) return [];
+    return item.genres.filter((g) => set.has(g));
+  }
+
+  function interestPillsHtml(genres, isPremiere = false, inline = false) {
+    if (!genres || !genres.length) return '';
+    const pills = genres
+      .map(
+        (g, i) =>
+          `<span class="interest-pill${isPremiere ? ' bounce' : ''}"${isPremiere ? ` style="animation-delay:${i * 110}ms"` : ''} title="${isPremiere ? `Premiere matching your interest: ${esc(g)}` : `Matches your interest: ${esc(g)}`}">${esc(g)}</span>`
+      )
+      .join('');
+    return inline ? pills : `<div class="interest-row">${pills}</div>`;
+  }
+
+  function evPillHtml(b, useShort = false) {
+    if (!b) return '';
+    return `<span class="ev-pill ${b.cls}" title="${esc(b.title || b.text)}">${esc(useShort ? b.short : b.text)}</span>`;
+  }
+
+  function groupWatchInfo(g) {
+    const isMovie = g.kind === 'movie';
+    if (isMovie) {
+      const done = Boolean(g.show.watched || (g.eps[0] && g.eps[0].watched));
+      return { total: 1, done: done ? 1 : 0, allDone: done, partial: false };
+    }
+    const total = g.eps.length;
+    const done = g.eps.filter((e) => e.watched).length;
+    return { total, done, allDone: total > 0 && done === total, partial: done > 0 && done < total };
+  }
+
+  function watchBtnHtml(g, w) {
+    return `<button class="watch-btn${w.allDone ? ' on' : ''}" type="button" data-watch="${esc(g.key)}" data-stop aria-pressed="${w.allDone}" title="${w.allDone ? 'Mark unwatched' : 'Mark watched / grabbed'}">${ICON.check}</button>`;
+  }
+
+  function visibilityBtnHtml(show, kind) {
+    if (show.hidden) {
+      return `<button class="unhide-btn" type="button" data-unhide="${show.id}" data-kind="${kind}" data-stop title="Unhide ${esc(show.name)}" aria-label="Unhide ${esc(show.name)}">${ICON.eye}<span>Unhide</span></button>`;
+    }
+    return `<button class="dismiss-btn subtle" type="button" data-hide-card="${show.id}" data-kind="${kind}" data-stop title="Hide ${esc(show.name)}" aria-label="Hide ${esc(show.name)}">${ICON.close}</button>`;
+  }
+
+  function cardHtml(g, idx, priority = false) {
+    const { show, eps, kind } = g;
+    const isMovie = kind === 'movie';
+    const isHidden = Boolean(show.hidden);
+    const w = groupWatchInfo(g);
+    const first = eps[0];
+    const last = eps[eps.length - 1];
+    const src = sourceOf(show);
+    const brand = brandColor(src.name);
+    const multi = !isMovie && eps.length > 1;
+    const code = isMovie
+      ? (show.premiered || show.airdate || '').slice(0, 4) || 'Movie'
+      : multi
+      ? `${epCode(first)}–${last.season === first.season ? 'E' + pad(last.number) : epCode(last)}`
+      : epCode(first);
+    const title = isMovie
+      ? [show.runtime ? `${show.runtime}m` : '', (show.genres || []).slice(0, 2).join(' · ')].filter(Boolean).join(' · ') || first.name
+      : multi
+      ? `${eps.length} episodes`
+      : first.name || 'TBA';
+    const { primary, isNew } = groupBadges(g);
+    const wpHtml = wpBadgesHtml(show, eps, true);
+    const wpRowHtml = wpBadgesHtml(show, eps, false);
+    const interests = matchedInterests(show);
+    const isPrem = Boolean(primary && (primary.cls === 'series-prem' || primary.cls === 'season-prem'));
+    const aired = !isMovie && first.airstamp && Date.parse(first.airstamp) < Date.now();
+    const time = isMovie ? (src.kind === 'tv' ? 'TV Premiere' : src.kind === 'physical' ? 'Physical' : 'Streaming') : timeLabel(first, show);
+    const isCompact = state.density === 'compact';
+    const tlBadges = !isCompact
+      ? [
+          primary ? `<span class="ep-tag ${primary.cls}" title="${esc(primary.title)}">${esc(primary.text)}</span>` : '',
+          isNew ? '<span class="ep-tag new" title="Brand-new release">New</span>' : '',
+        ]
+          .filter(Boolean)
+          .join('')
+      : '';
+    const inlineBadges = isCompact
+      ? [
+          wpHtml,
+          isHidden ? '<span class="hidden-pill">Hidden</span>' : '',
+          w.partial ? `<span class="watch-prog">${w.done}/${w.total} ✓</span>` : '',
+          primary && primary.cls !== 'movie' ? evPillHtml(primary, true) : '',
+          isNew ? '<span class="ev-pill new">New</span>' : '',
+        ]
+          .filter(Boolean)
+          .join('')
+      : '';
+    const visBtn = visibilityBtnHtml(show, kind);
+    const art = artHtml(show, priority);
+    return `
+      <article class="ep${aired ? ' aired' : ''}${show.favorite ? ' fav' : ''}${isHidden ? ' is-hidden-item' : ''}${w.allDone ? ' is-watched' : ''}${interests.length ? ' interest' : ''}${interests.length && isPrem ? ' interest-prem' : ''}" tabindex="0" data-key="${esc(g.key)}" style="--brand:${brand}">
+        <div class="ep-art">
+          ${art || `<div class="art-fallback">${esc(show.name)}</div>`}
+          ${!isCompact && tlBadges ? `<div class="ep-badges-tl">${tlBadges}</div>` : ''}
+          ${isCompact ? '' : `<span class="ep-time">${esc(time)}</span><span class="ep-code-badge">${esc(code)}</span>`}
+        </div>
+        <div class="ep-body">
+          <div class="ep-show-row">
+            <div class="ep-show">${esc(show.name)}</div>
+            <div class="ep-card-btns">
+              ${watchBtnHtml(g, w)}
+              <button class="fav-btn${show.favorite ? ' on' : ''}" type="button" data-fav="${show.id}" data-kind="${kind}" data-stop aria-pressed="${Boolean(show.favorite)}" title="${show.favorite ? 'Remove from Favorites' : 'Mark as Favorite'}">${show.favorite ? ICON.star : ICON.starOutline}</button>
+              ${visBtn}
+            </div>
+          </div>
+          ${inlineBadges ? `<div class="ep-compact-pills">${inlineBadges}</div>` : ''}
+          ${!isCompact && wpRowHtml ? `<div class="ep-compact-pills">${wpRowHtml}</div>` : ''}
+          ${!isCompact && w.partial ? `<div><span class="watch-prog">${w.done}/${w.total} watched</span></div>` : ''}
+          ${interests.length ? interestPillsHtml(interests, isPrem) : ''}
+          <div class="ep-title">${isCompact ? `<span class="ep-ctime">${esc(time)}</span>` : ''}${isMovie ? '' : `<span class="code">${esc(code)}</span>`}${esc(title)}</div>
+          <div class="ep-foot">
+            ${srcBadge(src.name, src.kind)}
+            ${extSearchBtnHtml(show, isMovie ? null : first)}
+          </div>
+        </div>
+      </article>`;
+  }
+
+  function agendaRowHtml(g) {
+    const { show, eps, kind } = g;
+    const isMovie = kind === 'movie';
+    const isHidden = Boolean(show.hidden);
+    const w = groupWatchInfo(g);
+    const first = eps[0];
+    const last = eps[eps.length - 1];
+    const src = sourceOf(show);
+    const brand = brandColor(src.name);
+    const multi = !isMovie && eps.length > 1;
+    const code = isMovie
+      ? (show.premiered || show.airdate || '').slice(0, 4) || 'Movie'
+      : multi
+      ? `${epCode(first)}–${last.season === first.season ? 'E' + pad(last.number) : epCode(last)}`
+      : epCode(first);
+    const title = isMovie
+      ? [show.runtime ? `${show.runtime}m` : '', (show.genres || []).slice(0, 2).join(' · ')].filter(Boolean).join(' · ') || first.name
+      : multi
+      ? `${eps.length} episodes`
+      : first.name || 'TBA';
+    const time = isMovie ? (src.kind === 'tv' ? 'TV' : src.kind === 'physical' ? 'Disc' : 'Digital') : timeLabel(first, show);
+    const { primary, isNew } = groupBadges(g);
+    const interests = matchedInterests(show);
+    const isPrem = Boolean(primary && (primary.cls === 'series-prem' || primary.cls === 'season-prem'));
+    const thumb = show.background && isMovie
+      ? `<img src="${esc(show.background)}" alt="" fetchpriority="low" decoding="async" onerror="this.style.display='none'">`
+      : show.banner
+      ? wideArtHtml(show.banner)
+      : show.poster
+      ? `<img src="${esc(show.poster)}" alt="" fetchpriority="low" decoding="async" onerror="this.style.display='none'">`
+      : show.logo
+      ? wideArtHtml(show.logo)
+      : '';
+    return `
+      <article class="agenda-row${show.favorite ? ' fav' : ''}${isHidden ? ' is-hidden-item' : ''}${w.allDone ? ' is-watched' : ''}${interests.length ? ' interest' : ''}${interests.length && isPrem ? ' interest-prem' : ''}" tabindex="0" data-key="${esc(g.key)}" style="--brand:${brand}">
+        <div class="agenda-time">${esc(time)}</div>
+        <div class="agenda-thumb">${thumb}</div>
+        <div class="agenda-main">
+          <div class="agenda-title">
+            <div class="agenda-title-main">
+              <span class="name">${esc(show.name)}</span>
+              ${wpBadgesHtml(show, eps, true)}
+              ${isHidden ? '<span class="hidden-pill">Hidden</span>' : ''}
+              ${w.partial ? `<span class="watch-prog">${w.done}/${w.total} ✓</span>` : ''}
+              ${primary ? evPillHtml(primary, primary.cls !== 'movie') : ''}
+              ${isNew ? '<span class="ev-pill new">New</span>' : ''}
+              ${interests.length ? interestPillsHtml(interests, isPrem, true) : ''}
+            </div>
+            <div class="ep-card-btns">
+              ${watchBtnHtml(g, w)}
+              <button class="fav-btn${show.favorite ? ' on' : ''}" type="button" data-fav="${show.id}" data-kind="${kind}" data-stop aria-pressed="${Boolean(show.favorite)}" title="${show.favorite ? 'Remove from Favorites' : 'Mark as Favorite'}">${show.favorite ? ICON.star : ICON.starOutline}</button>
+              ${visibilityBtnHtml(show, kind)}
+            </div>
+          </div>
+          <div class="agenda-sub"><span class="code">${esc(code)}</span>${esc(title)}</div>
+        </div>
+        <div class="agenda-actions">
+          ${srcBadge(src.name, src.kind)}
+          ${extSearchBtnHtml(show, isMovie ? null : first)}
+        </div>
+      </article>`;
+  }
+
+  let predecodeGen = 0;
+  const idle = window.requestIdleCallback || ((fn) => setTimeout(fn, 60));
+  function scheduleImagePredecode() {
+    const gen = ++predecodeGen;
+    const imgs = [...document.querySelectorAll('#calendar img')];
+    let i = 0;
+    const runBatch = () => {
+      if (gen !== predecodeGen) return;
+      let started = 0;
+      while (i < imgs.length && started < 4) {
+        const img = imgs[i++];
+        if (!img.isConnected) continue;
+        if (img.complete && img.naturalWidth > 0 && typeof img.decode === 'function') {
+          img.decode().catch(() => {});
+          started++;
+        } else if (!img.complete) {
+          img.addEventListener(
+            'load',
+            () => {
+              if (gen === predecodeGen && typeof img.decode === 'function') {
+                idle(() => {
+                  if (gen === predecodeGen) img.decode().catch(() => {});
+                });
+              }
+            },
+            { once: true }
+          );
+        }
+      }
+      if (i < imgs.length) idle(runBatch);
+    };
+    setTimeout(() => {
+      if (gen === predecodeGen) idle(runBatch);
+    }, 350);
+  }
+
+  function dayCardHtml(g, priority = false) {
+    const { show, eps, kind } = g;
+    const isMovie = kind === 'movie';
+    const isHidden = Boolean(show.hidden);
+    const w = groupWatchInfo(g);
+    const first = eps[0];
+    const last = eps[eps.length - 1];
+    const src = sourceOf(show);
+    const brand = brandColor(src.name);
+    const multi = !isMovie && eps.length > 1;
+    const code = isMovie
+      ? (show.premiered || show.airdate || '').slice(0, 4) || 'Movie'
+      : multi
+      ? `${epCode(first)}–${last.season === first.season ? 'E' + pad(last.number) : epCode(last)}`
+      : epCode(first);
+    const title = isMovie
+      ? [show.runtime ? `${show.runtime}m` : '', (show.genres || []).slice(0, 2).join(' · ')].filter(Boolean).join(' · ') || first.name
+      : multi
+      ? `${eps.length} episodes`
+      : first.name || 'TBA';
+    const { primary, isNew } = groupBadges(g);
+    const interests = matchedInterests(show);
+    const isPrem = Boolean(primary && (primary.cls === 'series-prem' || primary.cls === 'season-prem'));
+    const time = isMovie ? (src.kind === 'tv' ? 'TV Premiere' : src.kind === 'physical' ? 'Physical' : 'Streaming') : timeLabel(first, show);
+    const runtime = first.runtime || show.runtime;
+    const art = artHtml(show, priority);
+    const visBtn = visibilityBtnHtml(show, kind);
+    const tlBadges = [
+      primary ? `<span class="ep-tag ${primary.cls}" title="${esc(primary.title)}">${esc(primary.text)}</span>` : '',
+      isNew ? '<span class="ep-tag new" title="Brand-new release">New</span>' : '',
+    ]
+      .filter(Boolean)
+      .join('');
+
+    let descHtml = '';
+    if (isMovie) {
+      const sum = summaryText(first.summary || '');
+      descHtml = sum ? `<p class="day-card-desc">${esc(sum)}</p>` : '<p class="day-card-desc empty">No synopsis available yet.</p>';
+    } else if (!multi) {
+      const epSum = summaryText(first.summary || '');
+      const showSum = summaryText(first.showSummary || '');
+      if (epSum) descHtml = `<p class="day-card-desc">${esc(epSum)}</p>`;
+      else if (showSum) descHtml = `<p class="day-card-desc"><span class="muted">Series overview: </span>${esc(showSum)}</p>`;
+      else descHtml = '<p class="day-card-desc empty">No episode description available yet.</p>';
+    } else {
+      const showSum = summaryText(first.showSummary || '');
+      const epRows = eps
+        .map((e) => {
+          const eb = epEventBadge(e);
+          const es = summaryText(e.summary || '');
+          return `
+            <li class="day-ep-item${e.watched ? ' seen' : ''}">
+              <div class="day-ep-head">
+                <button class="ep-mini-chk${e.watched ? ' on' : ''}" type="button" data-ep-watch="${e.id}" data-stop title="${e.watched ? 'Mark unwatched' : 'Mark watched'}">${ICON.check}</button>
+                <span class="code">${esc(epCode(e))}</span>
+                <span>${esc(e.name || 'TBA')}</span>
+                ${eb ? evPillHtml(eb, true) : ''}
+              </div>
+              ${es ? `<p class="day-ep-sum">${esc(es)}</p>` : ''}
+            </li>`;
+        })
+        .join('');
+      descHtml = `${showSum ? `<p class="day-card-desc">${esc(showSum)}</p>` : ''}<ul class="day-ep-list">${epRows}</ul>`;
+    }
+
+    return `
+      <article class="day-card${show.favorite ? ' fav' : ''}${isHidden ? ' is-hidden-item' : ''}${w.allDone ? ' is-watched' : ''}${interests.length ? ' interest' : ''}" tabindex="0" data-key="${esc(g.key)}" style="--brand:${brand}">
+        <div class="day-card-art">
+          ${art || `<div class="art-fallback">${esc(show.name)}</div>`}
+          ${tlBadges ? `<div class="ep-badges-tl">${tlBadges}</div>` : ''}
+          <span class="ep-time">${esc(time)}</span>
+          <span class="ep-code-badge">${esc(code)}</span>
+        </div>
+        <div class="day-card-body">
+          <div class="day-card-top">
+            <div class="day-card-show">${esc(show.name)}</div>
+            <div class="ep-card-btns">
+              ${watchBtnHtml(g, w)}
+              <button class="fav-btn${show.favorite ? ' on' : ''}" type="button" data-fav="${show.id}" data-kind="${kind}" data-stop aria-pressed="${Boolean(show.favorite)}" title="${show.favorite ? 'Remove from Favorites' : 'Mark as Favorite'}">${show.favorite ? ICON.star : ICON.starOutline}</button>
+              ${visBtn}
+            </div>
+          </div>
+          <div class="day-card-meta">
+            ${wpBadgesHtml(show, eps, false)}
+            ${isHidden ? '<span class="hidden-pill">Hidden</span>' : ''}
+            ${w.partial ? `<span class="watch-prog">${w.done}/${w.total} watched</span>` : ''}
+            ${srcBadge(src.name, src.kind)}
+            ${runtime ? `<span class="day-card-runtime">${runtime} min</span>` : ''}
+            ${interests.length ? interestPillsHtml(interests, isPrem, true) : ''}
+            ${extSearchBtnHtml(show, isMovie ? null : first)}
+          </div>
+          ${!isMovie || title !== first.name ? `<div class="day-card-ep">${isMovie ? '' : `<span class="code">${esc(code)}</span>`}${esc(title)}</div>` : ''}
+          ${descHtml}
+        </div>
+      </article>`;
+  }
+
+  function monthItemHtml(g) {
+    const { show, eps, kind } = g;
+    const isMovie = kind === 'movie';
+    const isHidden = Boolean(show.hidden);
+    const w = groupWatchInfo(g);
+    const first = eps[0];
+    const last = eps[eps.length - 1];
+    const src = sourceOf(show);
+    const brand = brandColor(src.name);
+    const { primary, isNew } = groupBadges(g);
+    const interests = matchedInterests(show);
+    const isPrem = Boolean(primary && (primary.cls === 'series-prem' || primary.cls === 'season-prem'));
+    const multi = !isMovie && eps.length > 1;
+    const code = isMovie
+      ? src.kind === 'tv'
+        ? 'TV'
+        : src.kind === 'physical'
+        ? 'Disc'
+        : 'Movie'
+      : multi
+      ? `${epCode(first)}–${last.season === first.season ? 'E' + pad(last.number) : epCode(last)}`
+      : epCode(first);
+    const labels = [
+      `<span class="m-lbl">${esc(code)}</span>`,
+      wpBadgesHtml(show, eps, true),
+      w.allDone ? '<span class="m-lbl" title="Watched">✓</span>' : w.partial ? `<span class="m-lbl">${w.done}/${w.total}</span>` : '',
+      isHidden ? '<span class="hidden-pill">Hidden</span>' : '',
+      primary && primary.cls !== 'movie' ? evPillHtml(primary, true) : '',
+      isNew ? '<span class="ev-pill new">New</span>' : '',
+      show.favorite ? '<span class="m-lbl m-lbl-fav" title="Favorite">★</span>' : '',
+      interests.length
+        ? interests
+            .slice(0, 2)
+            .map((gr, i) => `<span class="interest-pill${isPrem ? ' bounce' : ''}"${isPrem ? ` style="animation-delay:${i * 110}ms"` : ''}>${esc(gr)}</span>`)
+            .join('')
+        : '',
+    ]
+      .filter(Boolean)
+      .join('');
+    return `
+      <button type="button" class="m-ev${show.favorite ? ' fav' : ''}${isHidden ? ' is-hidden-item' : ''}${w.allDone ? ' is-watched' : ''}${interests.length ? ' interest' : ''}" data-key="${esc(g.key)}" style="--brand:${brand}" title="${esc(`${show.name} · ${code}${w.allDone ? ' (Watched)' : ''}${isHidden ? ' (Hidden)' : ''}`)}">
+        <span class="m-ev-name">${esc(show.name)}</span>
+        <span class="m-ev-labels">${labels}</span>
+      </button>`;
+  }
+
+  function renderCalendar(scrollToday = false) {
+    predecodeGen++;
+    const cal = $('#calendar');
+    cal.className = `calendar ${state.density === 'day' ? 'day-view' : state.density}`;
+    const today = ymd(new Date());
+    const vr = viewRange();
+    if (state.density === 'day') {
+      const fd = new Date(state.focusDate + 'T12:00:00');
+      $('#weekTitle').textContent = fmtDay(fd, { weekday: 'long', month: 'short', day: 'numeric', year: 'numeric' });
+    } else if (state.density === 'month') {
+      const md = new Date(state.focusDate + 'T12:00:00');
+      $('#weekTitle').textContent = fmtDay(md, { month: 'long', year: 'numeric' });
+    } else if (vr.rollingAgenda) {
+      $('#weekTitle').textContent = 'Up Next · Next 14 days';
+    } else {
+      const end = addDays(state.weekStart, 6);
+      const sameMonth = state.weekStart.getMonth() === end.getMonth();
+      $('#weekTitle').textContent = `${fmtDay(state.weekStart, { month: 'short', day: 'numeric' })} – ${fmtDay(end, sameMonth ? { day: 'numeric' } : { month: 'short', day: 'numeric' })}, ${end.getFullYear()}`;
+    }
+
+    if (!state.showsLoaded || !state.loaded) return;
+
+    const totalShows = state.media === 'movies' ? state.movies.size : state.media === 'both' ? state.shows.size + state.movies.size : state.shows.size;
+    if (totalShows === 0) {
+      $('#weekMeta').textContent =
+        state.density === 'month'
+          ? fmtDay(new Date(state.focusDate + 'T12:00:00'), { month: 'long', year: 'numeric' })
+          : `Week ${isoWeek(state.weekStart)}`;
+      cal.innerHTML = emptyStateHtml();
+      bindEmptyState();
+      return;
+    }
+
+    const days = buildGroups(vr.start, vr.end);
+    const total = days.reduce((n, d) => n + d.groups.reduce((m, g) => m + g.eps.length, 0), 0);
+    const noun = state.media === 'movies' ? 'movie' : state.media === 'both' ? 'release' : 'episode';
+    const leadLabel =
+      state.density === 'day'
+        ? state.focusDate === today
+          ? 'Today'
+          : state.focusDate === ymd(addDays(new Date(), 1))
+          ? 'Tomorrow'
+          : `Week ${isoWeek(vr.start)}`
+        : state.density === 'month'
+        ? fmtDay(new Date(state.focusDate + 'T12:00:00'), { month: 'short', year: 'numeric' })
+        : vr.rollingAgenda
+        ? `${fmtDay(vr.start, { month: 'short', day: 'numeric' })} – ${fmtDay(vr.end, { month: 'short', day: 'numeric' })}`
+        : `Week ${isoWeek(state.weekStart)}`;
+    const metaParts = [leadLabel, `${total} ${noun}${total === 1 ? '' : 's'}`];
+    if (state.favoritesOnly) metaParts.push('Favorites only');
+    if (state.hideWatched) metaParts.push('Unwatched only');
+    if (state.genre) metaParts.push(state.genre);
+    if (state.channel) metaParts.push(state.channel);
+    if (state.media !== 'movies') metaParts.push(state.timeMode === 'local' ? 'your local time' : 'network time');
+    const clearBtn =
+      total === 0 && (state.filter !== 'all' || state.genre || state.channel || state.favoritesOnly || state.hideWatched)
+        ? ' <button id="clearFiltersBtn" class="clear-filters" type="button">Clear filters</button>'
+        : '';
+    $('#weekMeta').innerHTML = esc(metaParts.join(' · ')) + clearBtn;
+    const cf = $('#clearFiltersBtn');
+    if (cf) {
+      cf.addEventListener('click', () => {
+        state.filter = 'all';
+        state.genre = '';
+        state.channel = '';
+        state.favoritesOnly = false;
+        store.set('filter', 'all');
+        store.set('genre', '');
+        store.set('channel', '');
+        store.set('favOnly', '0');
+        $$('#filterSeg button').forEach((b) => b.classList.toggle('on', b.dataset.value === 'all'));
+        $('#genreFilter').value = '';
+        $('#genreWrap').classList.remove('active');
+        if ($('#channelFilter')) $('#channelFilter').value = '';
+        $('#channelWrap')?.classList.remove('active');
+        updateFavUi();
+        if (state.hideWatched) toggleHideWatched(false);
+        else renderCalendar();
+      });
+    }
+
+    if (state.density === 'day') {
+      const bucket = days[0] || { key: state.focusDate, groups: [] };
+      const d = new Date(bucket.key + 'T12:00:00');
+      const count = bucket.groups.reduce((m, g) => m + g.eps.length, 0);
+      cal.innerHTML = `
+        <section class="day${bucket.key === today ? ' today' : ''}" data-day="${bucket.key}">
+          <header class="day-head">
+            <div class="day-name">${esc(fmtDay(d, { weekday: 'long' }))}</div>
+            <div class="day-date"><span class="day-num">${d.getDate()}</span>${esc(fmtDay(d, { month: 'short', year: 'numeric' }))} · <span class="day-count">${count}</span></div>
+          </header>
+          <div class="day-body">
+            ${bucket.groups.length ? bucket.groups.map((g, i) => dayCardHtml(g, i < 3)).join('') : `<div class="day-empty">${state.media === 'movies' ? 'No movies scheduled for this day.' : 'No episodes scheduled for this day.'}</div>`}
+          </div>
+        </section>`;
+      scheduleImagePredecode();
+      return;
+    }
+
+    if (state.density === 'month') {
+      const dowNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+      cal.innerHTML = `
+        <div class="month-dow-row">${dowNames.map((w) => `<div class="month-dow">${w}</div>`).join('')}</div>
+        ${days
+          .map(({ key, groups }) => {
+            const d = new Date(key + 'T12:00:00');
+            const outMonth = d.getMonth() !== vr.month;
+            const count = groups.reduce((m, g) => m + g.eps.length, 0);
+            const cls = ['month-cell', outMonth ? 'out' : '', key === today ? 'today' : '', groups.length ? '' : 'empty-day'].filter(Boolean).join(' ');
+            const dayNum = d.getDate() === 1 ? fmtDay(d, { month: 'short', day: 'numeric' }) : String(d.getDate());
+            return `
+              <section class="${cls}" data-day="${key}">
+                <button type="button" class="month-day-jump" data-jump-day="${key}" title="Open ${esc(key)} in Day view">
+                  <span><span class="m-dow-inline">${esc(fmtDay(d, { weekday: 'short' }))}</span><span class="month-day-num">${esc(dayNum)}</span></span>
+                  ${count ? `<span class="day-count">${count}</span>` : ''}
+                </button>
+                <div class="month-cell-body">${groups.map(monthItemHtml).join('')}</div>
+              </section>`;
+          })
+          .join('')}`;
+      return;
+    }
+
+    if (state.density === 'agenda') {
+      const upcoming = days.filter((d) => (!vr.rollingAgenda || d.key >= today) && d.groups.length > 0);
+      cal.innerHTML = upcoming.length
+        ? upcoming
+            .map(({ key, groups }) => {
+              const d = new Date(key + 'T12:00:00');
+              const label = key === today ? 'Today' : key === ymd(addDays(new Date(), 1)) ? 'Tomorrow' : fmtDay(d, { weekday: 'long' });
+              const count = groups.reduce((m, g) => m + g.eps.length, 0);
+              return `
+              <section class="day${key === today ? ' today' : ''}" data-day="${key}">
+                <header class="day-head">
+                  <div class="day-name">${esc(label)}</div>
+                  <div class="day-date"><span class="day-num">${d.getDate()}</span>${esc(fmtDay(d, { month: 'short' }))} · <span class="day-count">${count}</span></div>
+                </header>
+                <div class="day-body">${groups.map(agendaRowHtml).join('')}</div>
+              </section>`;
+            })
+            .join('')
+        : `<div class="empty-state" style="padding:32px"><h2>${vr.rollingAgenda ? 'Nothing upcoming in the next 14 days' : 'Nothing upcoming this week'}</h2><p class="muted" style="margin:0">Try switching to Cards view, clearing filters, or jumping to next week.</p></div>`;
+      return;
+    }
+
+    let idx = 0;
+    cal.innerHTML = days
+      .map(({ key, groups }) => {
+        const d = new Date(key + 'T12:00:00');
+        const cls = ['day', key === today ? 'today' : key < today ? 'past' : '', groups.length ? '' : 'empty-day'].join(' ');
+        const count = groups.reduce((m, g) => m + g.eps.length, 0);
+        return `
+        <section class="${cls}" data-day="${key}">
+          <header class="day-head">
+            <div class="day-name">${esc(fmtDay(d, { weekday: 'long' }))}</div>
+            <div class="day-date"><span class="day-num">${d.getDate()}</span>${esc(fmtDay(d, { month: 'short' }))}${count ? ` · <span class="day-count">${count}</span>` : ''}</div>
+          </header>
+          <div class="day-body">
+            ${groups.length ? groups.map((g) => cardHtml(g, idx++, key === today)).join('') : `<div class="day-empty">${state.media === 'movies' ? 'No movies' : 'No episodes'}</div>`}
+          </div>
+        </section>`;
+      })
+      .join('');
+
+    // Scroll today's column/section into view on narrow/mobile screens.
+    const todayEl = $('.day.today', cal);
+    if (todayEl) {
+      if (cal.scrollWidth > cal.clientWidth) cal.scrollTo({ left: todayEl.offsetLeft - cal.offsetLeft - 16, behavior: 'auto' });
+      else if (scrollToday && window.innerWidth <= 720) todayEl.scrollIntoView({ behavior: 'auto', block: 'start' });
+    }
+    scheduleImagePredecode();
+  }
+
+  function hasTmdbKey() {
+    return Boolean(state.settings && state.settings.apiKeys && state.settings.apiKeys.tmdb);
+  }
+
+  const wizard = {
+    dismissed: false,
+    loading: false,
+    importing: false,
+    error: null,
+    catalog: null, // { fromDate, toDate, total, genres, shows }
+    selectedGenres: new Set(),
+    selectedLanguages: new Set(),
+    langOpen: false,
+    langQuery: '',
+    query: '',
+  };
+
+  async function loadOnboardingCatalog() {
+    if (wizard.catalog || wizard.loading) return;
+    wizard.loading = true;
+    wizard.error = null;
+    renderCalendar();
+    try {
+      wizard.catalog = await api('/api/onboarding/shows');
+    } catch (err) {
+      wizard.error = err.message;
+    } finally {
+      wizard.loading = false;
+      renderCalendar();
+    }
+  }
+
+  function filteredWizardShows(ignoreGenres = false, ignoreLanguages = false) {
+    const shows = (wizard.catalog && wizard.catalog.shows) || [];
+    const q = wizard.query.trim().toLowerCase();
+    return shows.filter((s) => {
+      const lang = s.language || 'Unknown';
+      if (!ignoreLanguages && wizard.selectedLanguages.size > 0 && !wizard.selectedLanguages.has(lang)) return false;
+      if (!ignoreGenres && wizard.selectedGenres.size > 0 && !(s.genres || []).some((g) => wizard.selectedGenres.has(g))) return false;
+      if (q && !s.name.toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }
+
+  function wizardFacetCounts(shows, readKeys, selectedSet, unknownLast = false) {
+    const counts = new Map();
+    for (const s of shows) {
+      for (const k of readKeys(s)) counts.set(k, (counts.get(k) || 0) + 1);
+    }
+    for (const k of selectedSet) if (!counts.has(k)) counts.set(k, 0);
+    return [...counts.entries()]
+      .map(([name, count]) => ({ name, count }))
+      .sort((a, b) => {
+        if (unknownLast) {
+          if (a.name === 'Unknown' && b.name !== 'Unknown') return 1;
+          if (b.name === 'Unknown' && a.name !== 'Unknown') return -1;
+        }
+        return b.count - a.count || a.name.localeCompare(b.name);
+      });
+  }
+
+  function wizardGenresForCurrentFilters() {
+    return wizardFacetCounts(filteredWizardShows(true, false), (s) => s.genres || [], wizard.selectedGenres);
+  }
+
+  function wizardLanguagesForCurrentFilters() {
+    return wizardFacetCounts(filteredWizardShows(false, true), (s) => [s.language || 'Unknown'], wizard.selectedLanguages, true);
+  }
+
+  function setWizLangOpen(open) {
+    wizard.langOpen = open;
+    if (!open) wizard.langQuery = '';
+  }
+
+  function wizardLangButtonLabel(allCount) {
+    const langs = [...wizard.selectedLanguages];
+    if (!langs.length) return `All languages (${allCount})`;
+    if (langs.length <= 2) return langs.join(', ');
+    return `${langs.length} languages`;
+  }
+
+  function renderWizardLangList(languages) {
+    const q = wizard.langQuery.trim().toLowerCase();
+    const visible = q ? languages.filter((l) => l.name.toLowerCase().includes(q)) : languages;
+    if (!visible.length) return '<div class="muted" style="font-size:12px;padding:6px 7px">No matching languages.</div>';
+    return visible
+      .map((l) => {
+        const on = wizard.selectedLanguages.has(l.name);
+        return `<label class="wiz-lang-opt${on ? ' on' : ''}"><input type="checkbox" data-wlang="${esc(l.name)}"${on ? ' checked' : ''} /><span class="wiz-lang-name">${esc(l.name)}</span><span class="wiz-lang-count">${l.count}</span></label>`;
+      })
+      .join('');
+  }
+
+  function rerenderWizKeepingLangScroll() {
+    const prevScroll = $('#wizLangList')?.scrollTop || 0;
+    renderCalendar();
+    const list = $('#wizLangList');
+    if (list) list.scrollTop = prevScroll;
+  }
+
+  function emptyStateHtml() {
+    const disc = state.status && state.status.discovery;
+    const mdisc = state.status && state.status.movieDiscovery;
+    const scanning = Boolean((disc && disc.running) || (mdisc && mdisc.running));
+    const total = ((disc && disc.total) || 0) + ((mdisc && mdisc.total) || 0);
+    const done = ((disc && disc.done) || 0) + ((mdisc && mdisc.done) || 0);
+    const pct = scanning && total ? Math.round((done / total) * 100) : 0;
+    const tmdbReady = hasTmdbKey();
+    const isMovies = state.media === 'movies';
+    const curName = (disc && disc.running && disc.current) || (mdisc && mdisc.running && mdisc.current) || '';
+
+    if (scanning) {
+      return `
+        <div class="empty-state">
+          <div class="big-icon">${ICON.tvBig}</div>
+          <h2>Scanning premieres…</h2>
+          <p>Discovering new releases on TVmaze and TMDB${total ? ` — ${done} of ${total} checked` : ''}${curName ? ` (${esc(curName)})` : ''}.</p>
+          <div class="progress"><i style="width:${pct}%"></i></div>
+        </div>`;
+    }
+
+    if (isMovies || wizard.dismissed || state.shows.size > 0 || state.movies.size > 0) {
+      const heading = isMovies ? 'No movies scheduled yet' : 'Your calendar is empty';
+      const body = isMovies
+        ? tmdbReady
+          ? 'Search above to add movies to your browser calendar, or browse upcoming releases from the shared catalog.'
+          : 'Search above to add Apple TV / iTunes movies to your browser calendar, or browse upcoming releases from the shared catalog.'
+        : 'Search shows & movies above to add titles locally, or re-open the setup wizard to customize your calendar.';
+      return `
+        <div class="empty-state">
+          <div class="big-icon">${ICON.tvBig}</div>
+          <h2>${heading}</h2>
+          <p>${body}</p>
+          <div class="empty-services">
+            <span class="api-status-pill ok">TVmaze · Ready</span>
+            <span class="api-status-pill ok">${tmdbReady ? 'TMDB · Connected' : 'Keyless Movies · Ready'}</span>
+          </div>
+          <div class="empty-actions">
+            ${!isMovies ? '<button class="btn" id="emptyWizardBtn" type="button">Launch setup wizard</button>' : ''}
+            <button class="btn btn-ghost" id="emptySearchBtn" type="button">${ICON.search} Search shows &amp; movies</button>
+          </div>
+        </div>`;
+    }
+
+    const cat = wizard.catalog;
+    if (!cat && !wizard.loading && !wizard.error) {
+      queueMicrotask(() => loadOnboardingCatalog());
+    }
+    const matches = cat ? filteredWizardShows() : [];
+    const genres = cat ? wizardGenresForCurrentFilters() : [];
+    const languages = cat ? wizardLanguagesForCurrentFilters() : [];
+    const allLangCount = cat ? filteredWizardShows(false, true).length : 0;
+    const langList = [...wizard.selectedLanguages];
+    const langSummary = langList.length
+      ? ` · ${langList.slice(0, 3).join(', ')}${langList.length > 3 ? ` +${langList.length - 3}` : ''}`
+      : '';
+    const fromLabel = (cat && cat.fromDate) || ymd(startOfWeek(new Date()));
+    const toDateObj = new Date(fromLabel + 'T12:00:00');
+    toDateObj.setMonth(toDateObj.getMonth() + 2);
+    const toLabel = (cat && cat.toDate) || ymd(toDateObj);
+    return `
+      <div class="empty-state wizard">
+        <div class="big-icon">${ICON.tvBig}</div>
+        <h2>Customize your upcoming shows</h2>
+        <p>Add upcoming shows airing from Monday <b>${esc(fromLabel)}</b> through <b>${esc(toLabel)}</b> to your browser calendar. Filter by genre or language below — or leave filters unselected to include everything.</p>
+        <div class="wiz-panel">
+          ${
+            wizard.loading || (!cat && !wizard.error)
+              ? '<div class="imp-loading" style="justify-content:center;padding:18px 0"><span class="spinner"></span><span>Loading upcoming TVmaze schedule…</span></div>'
+              : wizard.error
+              ? `<p class="muted" style="margin:0">${esc(wizard.error)}</p><div><button class="btn btn-small" id="wizRetryCatBtn" type="button">Retry</button></div>`
+              : `
+                <div class="wiz-toolbar">
+                  <input id="wizFilterInput" type="search" value="${esc(wizard.query)}" placeholder="Filter matching shows…" autocomplete="off" />
+                  <div class="wiz-lang-drop">
+                    <button type="button" id="wizLangBtn" class="wiz-lang-btn${wizard.selectedLanguages.size ? ' active' : ''}" aria-haspopup="listbox" aria-expanded="${wizard.langOpen}" title="${esc(langList.join(', ') || 'All languages')}">
+                      <span class="wiz-lang-btn-text">${esc(wizardLangButtonLabel(allLangCount))}</span>
+                      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    </button>
+                    <div id="wizLangMenu" class="wiz-lang-menu"${wizard.langOpen ? '' : ' hidden'}>
+                      <div class="wiz-lang-head">
+                        <input id="wizLangSearch" type="search" value="${esc(wizard.langQuery)}" placeholder="Filter languages…" autocomplete="off" />
+                        ${wizard.selectedLanguages.size ? '<button class="mini-text-btn muted-btn" id="wizLangClearBtn" type="button">Clear</button>' : ''}
+                        <button class="mini-text-btn" id="wizLangDoneBtn" type="button">Done</button>
+                      </div>
+                      <div id="wizLangList" class="wiz-lang-list">
+                        ${renderWizardLangList(languages)}
+                      </div>
+                    </div>
+                  </div>
+                  ${wizard.selectedGenres.size ? '<button class="mini-text-btn muted-btn" id="wizClearGenresBtn" type="button">All genres</button>' : ''}
+                </div>
+                <div class="wiz-genres">
+                  ${genres
+                    .map(
+                      (g) =>
+                        `<button type="button" class="wiz-gchip${wizard.selectedGenres.has(g.name) ? ' on' : ''}" data-wgenre="${esc(g.name)}">${esc(g.name)} (${g.count})</button>`
+                    )
+                    .join('')}
+                </div>
+                <div class="wiz-toolbar" style="font-size:12px;color:var(--muted)">
+                  <span><b>${matches.length}</b> show${matches.length === 1 ? '' : 's'} airing ${esc(fromLabel)} – ${esc(toLabel)}${esc(langSummary)}${wizard.selectedGenres.size ? ` · ${esc([...wizard.selectedGenres].join(', '))}` : ''}</span>
+                </div>
+                ${
+                  matches.length
+                    ? `<ul class="wiz-preview-list">${matches
+                        .slice(0, 60)
+                        .map(
+                          (s) =>
+                            `<li class="wiz-show"><span class="wiz-show-name" title="${esc(s.name)}">${esc(s.name)}</span><span class="wiz-show-meta">${esc([s.network, s.nextAirdate, (s.genres || []).slice(0, 2).join(', ')].filter(Boolean).join(' · '))}</span></li>`
+                        )
+                        .join('')}${matches.length > 60 ? `<li class="wiz-show"><span class="wiz-show-name">+ ${matches.length - 60} more shows</span><span class="wiz-show-meta">All ${matches.length} will be added</span></li>` : ''}</ul>`
+                    : '<div class="muted" style="font-size:12px">No upcoming shows match those filters.</div>'
+                }`
+          }
+        </div>
+        <div class="empty-actions">
+          <button class="btn" id="wizImportBtn" type="button"${!cat || !matches.length || wizard.importing ? ' disabled' : ''}>${wizard.importing ? 'Adding…' : `Add ${matches.length} show${matches.length === 1 ? '' : 's'}`}</button>
+          <button class="btn btn-ghost" id="wizDismissBtn" type="button"${wizard.importing ? ' disabled' : ''}>Cancel</button>
+        </div>
+      </div>`;
+  }
+  function bindEmptyState() {
+    $('#emptyWizardBtn')?.addEventListener('click', () => {
+      wizard.dismissed = false;
+      renderCalendar();
+      loadOnboardingCatalog();
+    });
+    $('#emptySearchBtn')?.addEventListener('click', () => {
+      searchInput.focus();
+      searchInput.select();
+    });
+    $('#wizDismissBtn')?.addEventListener('click', () => {
+      setWizLangOpen(false);
+      wizard.dismissed = true;
+      renderCalendar();
+    });
+    $('#wizRetryCatBtn')?.addEventListener('click', () => {
+      wizard.catalog = null;
+      loadOnboardingCatalog();
+    });
+    $('#wizFilterInput')?.addEventListener('input', (e) => {
+      const pos = e.target.selectionStart;
+      wizard.query = e.target.value;
+      renderCalendar();
+      const inp = $('#wizFilterInput');
+      if (inp) {
+        inp.focus();
+        if (pos !== null) inp.setSelectionRange(pos, pos);
+      }
+    });
+    $('.wiz-lang-drop')?.addEventListener('click', (e) => e.stopPropagation());
+    $('#wizLangBtn')?.addEventListener('click', () => {
+      setWizLangOpen(!wizard.langOpen);
+      renderCalendar();
+      if (wizard.langOpen) $('#wizLangSearch')?.focus();
+      else $('#wizLangBtn')?.focus();
+    });
+    $('#wizLangDoneBtn')?.addEventListener('click', () => {
+      setWizLangOpen(false);
+      renderCalendar();
+      $('#wizLangBtn')?.focus();
+    });
+    $('#wizLangClearBtn')?.addEventListener('click', () => {
+      wizard.selectedLanguages.clear();
+      rerenderWizKeepingLangScroll();
+      $('#wizLangSearch')?.focus();
+    });
+    $('#wizLangSearch')?.addEventListener('input', (e) => {
+      wizard.langQuery = e.target.value;
+      const list = $('#wizLangList');
+      if (list && wizard.catalog) list.innerHTML = renderWizardLangList(wizardLanguagesForCurrentFilters());
+    });
+    $('#wizLangList')?.addEventListener('change', (e) => {
+      const cb = e.target.closest('[data-wlang]');
+      if (!cb) return;
+      const lang = cb.dataset.wlang;
+      if (cb.checked) wizard.selectedLanguages.add(lang);
+      else wizard.selectedLanguages.delete(lang);
+      rerenderWizKeepingLangScroll();
+    });
+    $('#wizClearGenresBtn')?.addEventListener('click', () => {
+      wizard.selectedGenres.clear();
+      renderCalendar();
+    });
+    $$('[data-wgenre]').forEach((b) =>
+      b.addEventListener('click', () => {
+        const g = b.dataset.wgenre;
+        if (wizard.selectedGenres.has(g)) wizard.selectedGenres.delete(g);
+        else wizard.selectedGenres.add(g);
+        renderCalendar();
+      })
+    );
+    $('#wizImportBtn')?.addEventListener('click', async () => {
+      const matches = filteredWizardShows();
+      if (!matches.length || wizard.importing) return;
+      setWizLangOpen(false);
+      wizard.importing = true;
+      renderCalendar();
+      try {
+        const lib = window.ViuhtiClient.getLib();
+        let added = 0;
+        const missingIds = [];
+        for (const s of matches) {
+          const id = Number(s.id);
+          if (!id) continue;
+          if (lib.hiddenShows[String(id)]) {
+            delete lib.hiddenShows[String(id)];
+            added++;
+          }
+          if (!publicServerShowIds.has(id) && !lib.addedShows[String(id)]) {
+            lib.addedShows[String(id)] = { id, source: 'onboarding', addedAt: Date.now() };
+            missingIds.push(id);
+            added++;
+          }
+        }
+        window.ViuhtiClient.saveLib(lib);
+        if (missingIds.length) {
+          const hyd = await api('/api/catalog/hydrate', {
+            method: 'POST',
+            body: JSON.stringify({ showIds: missingIds.slice(0, 60), movieIds: [] }),
+          }).catch(() => null);
+          if (hyd && Array.isArray(hyd.shows)) {
+            for (const sh of hyd.shows) {
+              if (sh && sh.id && !rawServerShows.some((x) => x.id === sh.id)) rawServerShows.push(sh);
+            }
+          }
+        }
+        wizard.dismissed = true;
+        toast(`Added ${added || matches.length} upcoming show${(added || matches.length) === 1 ? '' : 's'} to your browser calendar!`, 'ok');
+        await reloadAll();
+      } catch (err) {
+        toast(err.message, 'err');
+      } finally {
+        wizard.importing = false;
+        if (state.shows.size === 0) renderCalendar();
+      }
+    });
+  }
+
+  // ---------- Episode modal ----------
+  const detailCache = new Map();
+  const richDetailCache = new Map();
+  const richSpotCache = new Map();
+  let richAbort = null;
+  let spotAbort = null;
+  let modalSeq = 0;
+
+  function personInitials(name) {
+    const parts = String(name || '').trim().split(/\s+/).filter(Boolean);
+    return parts.length >= 2 ? (parts[0][0] + parts[parts.length - 1][0]).toUpperCase() : String(parts[0] || '?').slice(0, 2).toUpperCase();
+  }
+
+  function wikiTitleFromHref(url) {
+    if (!url) return null;
+    try {
+      const u = new URL(url);
+      if (!u.hostname.endsWith('wikipedia.org')) return null;
+      return decodeURIComponent(u.pathname.replace(/^\/wiki\//, '').replace(/_/g, ' ')) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function personCardHtml(p, isCast = true) {
+    const spotPayload = {
+      kind: 'person',
+      seedKind: 'person',
+      seedId: p.tvmazePersonId || null,
+      seedTmdbId: p.tmdbPersonId || null,
+      seedQid: p.qid || null,
+      wikiTitle: wikiTitleFromHref(p.wikiUrl),
+      wikiUrl: p.wikiUrl || null,
+      wikiDesc: p.wikiDesc || '',
+      image: p.image || null,
+      role: p.role || (isCast ? 'Cast' : 'Crew'),
+      seedName: p.name,
+    };
+    const imgHtml = p.image
+      ? `<img class="m-person-img" src="${esc(p.image)}" alt="${esc(p.name)}" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display='grid'"><span class="m-person-ph" style="display:none">${esc(personInitials(p.name))}</span>`
+      : `<span class="m-person-ph">${esc(personInitials(p.name))}</span>`;
+    return `
+      <div class="m-person-card${isCast ? ' cast' : ' crew'}" role="button" tabindex="0" data-spotlight='${esc(JSON.stringify(spotPayload))}' title="View biography &amp; details for ${esc(p.name)}">
+        <div class="m-person-ava">${imgHtml}</div>
+        <div class="m-person-info">
+          <div class="m-person-name">${esc(p.name)}</div>
+          <div class="m-person-role" title="${esc(p.wikiDesc || p.role || '')}">${esc(p.role || (isCast ? 'Cast' : 'Crew'))}</div>
+        </div>
+        ${p.wikiUrl ? `<a class="m-person-w" href="${esc(p.wikiUrl)}" target="_blank" rel="noopener noreferrer" data-stop title="Open Wikipedia article for ${esc(p.name)}">W</a>` : ''}
+      </div>`;
+  }
+
+  function renderSpotlightCard(spotBox, info, dossier, loading = false) {
+    if (!spotBox) return;
+    spotBox.hidden = false;
+    const isSource = info.seedKind === 'source';
+    const d = dossier || {};
+    const imgSrc = info.image || d.thumbnail || null;
+    const wikiUrl = d.wikiUrl || info.wikiUrl || null;
+    const lifeStr = d.birthYear ? `${d.birthYear}${d.deathYear ? `–${d.deathYear}` : '–present'}` : '';
+    const subFacts = isSource
+      ? [d.pubYear ? `Published ${d.pubYear}` : '', (d.sourceGenres || []).slice(0, 3).join(', '), (d.authors || []).map((a) => `Author: ${a.name}`).join(', ')].filter(Boolean)
+      : [d.description || info.wikiDesc, lifeStr ? `Born ${lifeStr}` : '', d.birthPlace, (d.occupations || []).slice(0, 3).join(', ')].filter(Boolean);
+    const conf = typeof d.confidence === 'number' ? d.confidence : null;
+    const confPill =
+      conf && conf > 0 && conf < 90
+        ? `<span class="m-uncertain-pill" title="Matched by name search without a shared IMDb/TMDB person ID">Is this true? ~${conf}%</span>`
+        : '';
+
+    const gbSeed = {
+      seedKind: info.seedKind,
+      ...(info.seedId ? { seedId: info.seedId } : {}),
+      ...(info.seedTmdbId ? { seedTmdbId: info.seedTmdbId } : {}),
+      ...(d.qid || info.seedQid ? { seedQid: d.qid || info.seedQid } : {}),
+      ...(d.wikiTitle || info.wikiTitle ? { seedWikiTitle: d.wikiTitle || info.wikiTitle } : {}),
+      seedName: info.seedName,
+    };
+
+    spotBox.innerHTML = `
+      <div class="m-spot-head">
+        ${
+          imgSrc
+            ? `<img class="m-spot-img" src="${esc(imgSrc)}" alt="${esc(info.seedName)}" onerror="this.style.display='none'">`
+            : `<div class="m-spot-ph">${isSource ? '📖' : esc(personInitials(info.seedName))}</div>`
+        }
+        <div class="m-spot-meta">
+          <div class="m-spot-badges">
+            <span class="gb-type-tag ${isSource ? 'source' : 'person'}">${esc(info.role || (isSource ? 'Source Work' : 'Person'))}</span>
+            ${confPill}
+          </div>
+          <h4 class="m-spot-title">${esc(info.seedName)}</h4>
+          ${subFacts.length ? `<div class="m-spot-sub">${esc(subFacts.join(' · '))}</div>` : ''}
+        </div>
+        <button type="button" class="icon-btn m-spot-close" id="mSpotCloseBtn" aria-label="Close details panel">×</button>
+      </div>
+      ${
+        loading
+          ? `<div class="m-rich-loading"><span class="spinner" aria-hidden="true"></span><span>Loading formatted Wikipedia dossier…</span></div>`
+          : d.extract
+          ? `<p class="m-spot-ext">${esc(d.extract)}</p>`
+          : `<p class="m-spot-ext muted">${d.found ? 'Matched entry on Wikidata/Wikipedia.' : 'No detailed Wikipedia biography found for this entry.'}</p>`
+      }
+      ${
+        (d.awards || []).length
+          ? `<div class="m-lore-tags">${d.awards
+              .slice(0, 4)
+              .map((a) => `<span class="m-lore-tag award" title="${esc(a)}">🏆 ${esc(a)}</span>`)
+              .join('')}${d.awardsTotal > 4 ? `<span class="m-lore-tag award">+${d.awardsTotal - 4} awards</span>` : ''}</div>`
+          : ''
+      }
+      <div class="m-spot-actions">
+        <button type="button" class="btn btn-small" id="mSpotGbBtn">⚡ Explore in Graxobolt</button>
+        ${wikiUrl ? `<a class="btn btn-small btn-ghost" href="${esc(wikiUrl)}" target="_blank" rel="noopener noreferrer">W Wikipedia ↗</a>` : ''}
+        <button type="button" class="btn btn-small btn-ghost" id="mSpotDismissBtn">Close</button>
+      </div>`;
+
+    const dismiss = () => {
+      spotAbort?.abort();
+      spotBox.hidden = true;
+      spotBox.innerHTML = '';
+      spotBox.closest('#modalRich')?.querySelectorAll('[data-spotlight].selected').forEach((n) => n.classList.remove('selected'));
+    };
+    spotBox.querySelector('#mSpotCloseBtn')?.addEventListener('click', dismiss);
+    spotBox.querySelector('#mSpotDismissBtn')?.addEventListener('click', dismiss);
+    spotBox.querySelector('#mSpotGbBtn')?.addEventListener('click', () => {
+      closeModal();
+      openGraxobolt(gbSeed);
+    });
+  }
+
+  async function openModalSpotlight(spotBox, info, seq) {
+    spotAbort?.abort();
+    const cacheKey = `${info.seedKind}|${info.seedQid || ''}|${info.wikiTitle || ''}|${info.seedName}`;
+    if (richSpotCache.has(cacheKey)) {
+      renderSpotlightCard(spotBox, info, richSpotCache.get(cacheKey), false);
+      spotBox.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      return;
+    }
+
+    spotAbort = new AbortController();
+    renderSpotlightCard(spotBox, info, null, true);
+    spotBox.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+
+    try {
+      const qs = new URLSearchParams({
+        kind: info.seedKind === 'source' ? 'source' : 'person',
+        name: info.seedName || '',
+        ...(info.seedQid ? { qid: info.seedQid } : {}),
+        ...(info.wikiTitle ? { wikiTitle: info.wikiTitle } : {}),
+      });
+      const res = await api(`/api/galaxy/wiki?${qs}`, { signal: spotAbort.signal });
+      if (seq !== modalSeq || $('#modal').hidden || spotBox.hidden) return;
+      if (richSpotCache.size >= 40) {
+        const first = richSpotCache.keys().next().value;
+        if (first !== undefined) richSpotCache.delete(first);
+      }
+      richSpotCache.set(cacheKey, res);
+      renderSpotlightCard(spotBox, info, res, false);
+    } catch (err) {
+      if (err && err.name === 'AbortError') return;
+      if (seq === modalSeq && !spotBox.hidden) renderSpotlightCard(spotBox, info, { found: false }, false);
+    }
+  }
+
+  function renderRichModalContent(richEl, data, existingSummary = '', seq = modalSeq) {
+    if (!richEl || !data) return;
+    const cast = data.cast || [];
+    const crew = data.crew || [];
+    const wiki = data.wiki || {};
+    const studios = data.studios || [];
+    const ext = String(wiki.extract || wiki.description || '').trim();
+    const sumNorm = stripHtml(existingSummary || '').toLowerCase();
+    const showWikiExt = ext && (!sumNorm || !sumNorm.includes(ext.slice(0, 60).toLowerCase()));
+    const longWikiExt = showWikiExt && ext.length > 220;
+
+    if (!cast.length && !crew.length && !wiki.found && !studios.length && !data.tagline) {
+      richEl.hidden = true;
+      return;
+    }
+
+    const wikiTags = [
+      ...(wiki.basedOn || []).map(
+        (b) =>
+          `<button type="button" class="m-lore-chip source" data-spotlight='${esc(
+            JSON.stringify({ kind: 'source', seedKind: 'source', seedQid: b.qid, seedName: b.name, role: 'Source Work' })
+          )}' title="View details for ${esc(b.name)}">📖 Adapted from ${esc(b.name)}</button>`
+      ),
+      ...studios.slice(0, 4).map((s) => `<span class="m-lore-tag">🎬 ${esc(s)}</span>`),
+      ...(wiki.awards || []).slice(0, 5).map((a) => `<span class="m-lore-tag award" title="${esc(a)}">🏆 ${esc(a)}</span>`),
+      ...(wiki.awardsTotal > 5 ? [`<span class="m-lore-tag award">+${wiki.awardsTotal - 5} awards</span>`] : []),
+      ...(wiki.filmingLocations || []).map((l) => `<span class="m-lore-tag">📍 Filmed in ${esc(l)}</span>`),
+      ...(wiki.locations || []).map((l) => `<span class="m-lore-tag">🌍 Set in ${esc(l)}</span>`),
+      ...(wiki.movements || []).map((m) => `<span class="m-lore-tag">🎞️ ${esc(m)}</span>`),
+    ];
+
+    const titleConfPill =
+      typeof wiki.confidence === 'number' && wiki.confidence > 0 && wiki.confidence < 90
+        ? `<span class="m-uncertain-pill" title="Fuzzy Wikipedia search without IMDb ID">Is this true? ~${wiki.confidence}%</span>`
+        : '';
+
+    richEl.hidden = false;
+    richEl.innerHTML = `
+      ${data.tagline ? `<div class="m-tagline">“${esc(data.tagline)}”</div>` : ''}
+      ${
+        crew.length
+          ? `<section class="m-rich-sec">
+              <div class="m-rich-head"><h4>Creators &amp; Crew</h4><span class="muted">${crew.length} · click for bio</span></div>
+              <div class="m-people-grid crew">${crew.map((p) => personCardHtml(p, false)).join('')}</div>
+            </section>`
+          : ''
+      }
+      ${
+        cast.length
+          ? `<section class="m-rich-sec">
+              <div class="m-rich-head"><h4>Cast &amp; Actors</h4><span class="muted">${cast.length} · click for bio</span></div>
+              <div class="m-people-grid cast">${cast.map((p) => personCardHtml(p, true)).join('')}</div>
+            </section>`
+          : ''
+      }
+      <div class="m-spotlight" id="mSpotlightBox" hidden></div>
+      ${
+        wiki.found || wikiTags.length
+          ? `<section class="m-rich-sec m-wiki-card">
+              <div class="m-wiki-card-head">
+                <div class="m-wiki-brand"><span class="gb-wiki-mark" aria-hidden="true">W</span><b>Wikipedia &amp; Wikidata Lore</b>${titleConfPill}</div>
+                ${wiki.wikiUrl ? `<a class="m-wiki-extlink" href="${esc(wiki.wikiUrl)}" target="_blank" rel="noopener noreferrer">${esc(wiki.wikiTitle || data.name || 'Article')} ↗</a>` : ''}
+              </div>
+              ${showWikiExt ? `<p class="m-wiki-ext${longWikiExt ? ' clamped' : ''}" id="mWikiExtP">${esc(ext)}</p>` : ''}
+              ${longWikiExt ? `<button type="button" class="gb-wiki-more" id="mWikiMoreBtn">Read more</button>` : ''}
+              ${wikiTags.length ? `<div class="m-lore-tags">${wikiTags.join('')}</div>` : ''}
+            </section>`
+          : ''
+      }`;
+
+    richEl.querySelector('#mWikiMoreBtn')?.addEventListener('click', (e) => {
+      const p = richEl.querySelector('#mWikiExtP');
+      if (!p) return;
+      const clamped = p.classList.toggle('clamped');
+      e.currentTarget.textContent = clamped ? 'Read more' : 'Show less';
+    });
+
+    const spotBox = richEl.querySelector('#mSpotlightBox');
+    const toggleSpotlight = (el) => {
+      try {
+        const info = JSON.parse(el.dataset.spotlight);
+        const wasSelected = el.classList.contains('selected');
+        richEl.querySelectorAll('[data-spotlight].selected').forEach((n) => n.classList.remove('selected'));
+        if (wasSelected && spotBox && !spotBox.hidden) {
+          spotAbort?.abort();
+          spotBox.hidden = true;
+          spotBox.innerHTML = '';
+          return;
+        }
+        el.classList.add('selected');
+        openModalSpotlight(spotBox, info, seq);
+      } catch {
+        /* ignore */
+      }
+    };
+    richEl.querySelectorAll('[data-spotlight]').forEach((el) => {
+      el.addEventListener('click', (e) => {
+        if (e.target.closest('a[data-stop]')) return;
+        toggleSpotlight(el);
+      });
+      el.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          toggleSpotlight(el);
+        }
+      });
+    });
+  }
+
+  async function mountModalRichDetails({ kind, id, tvmazeId, tmdbId, imdbId, name, year, existingSummary, richEl, seq }) {
+    if (!richEl) return;
+    richAbort?.abort();
+    spotAbort?.abort();
+    const cacheKey = `${kind}:${tvmazeId || id || 0}:${tmdbId || 0}:${(name || '').toLowerCase()}`;
+    if (richDetailCache.has(cacheKey)) {
+      renderRichModalContent(richEl, richDetailCache.get(cacheKey), existingSummary, seq);
+      return;
+    }
+
+    richAbort = new AbortController();
+    richEl.hidden = false;
+    richEl.innerHTML = `<div class="m-rich-loading"><span class="spinner" aria-hidden="true"></span><span>Loading cast portraits, crew &amp; Wikipedia lore…</span></div>`;
+    try {
+      const qs = new URLSearchParams({
+        kind: kind === 'movie' ? 'movie' : 'show',
+        ...(id ? { id: String(id) } : {}),
+        ...(tvmazeId ? { tvmazeId: String(tvmazeId) } : {}),
+        ...(tmdbId ? { tmdbId: String(tmdbId) } : {}),
+        ...(imdbId ? { imdbId } : {}),
+        ...(name ? { name } : {}),
+        ...(year ? { year: String(year).slice(0, 4) } : {}),
+      });
+      const data = await api(`/api/item/rich?${qs}`, { signal: richAbort.signal });
+      if (seq !== modalSeq || $('#modal').hidden) return;
+      if (richDetailCache.size >= 30) {
+        const first = richDetailCache.keys().next().value;
+        if (first !== undefined) richDetailCache.delete(first);
+      }
+      richDetailCache.set(cacheKey, data);
+      renderRichModalContent(richEl, data, existingSummary, seq);
+    } catch (err) {
+      if (err && err.name === 'AbortError') return;
+      if (seq === modalSeq && richEl) richEl.hidden = true;
+    }
+  }
+
+  function openModal(key) {
+    const g = state.groups.get(key);
+    if (!g) return;
+    const seq = ++modalSeq;
+    $('.modal-card')?.classList.remove('wide');
+    const { show, eps, kind } = g;
+    const isMovie = kind === 'movie';
+    const first = eps[0];
+    const src = sourceOf(show);
+    const cacheKey = `${kind}:${show.id}:${!isMovie && eps.length === 1 ? first.id : ''}`;
+    const det = detailCache.get(cacheKey);
+    const heroImg = (det && (det.background || det.posterLarge)) || show.background || show.banner || show.posterLarge || show.poster || '';
+    const d = !isMovie && first.airstamp && first.airtime ? new Date(first.airstamp) : new Date(first.airdate + 'T12:00:00');
+    const localWhen = !isMovie && first.airtime
+      ? `${fmtDay(d, { weekday: 'short', day: 'numeric', month: 'short' })} · ${fmtTime(d)} your time`
+      : `${fmtDay(d, { weekday: 'short', day: 'numeric', month: 'short' })}`;
+    let networkWhen = '';
+    if (!isMovie && first.airtime && src.tz) {
+      try {
+        networkWhen = `${new Intl.DateTimeFormat(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit', timeZoneName: 'short', timeZone: src.tz }).format(d)} (${src.country || 'network'})`;
+      } catch { /* ignore invalid tz */ }
+    }
+    const rawSummary = det
+      ? !isMovie && eps.length === 1 && det.episodeSummary
+        ? det.episodeSummary
+        : det.summary
+      : !isMovie && eps.length === 1 && first.summary
+      ? first.summary
+      : show.summary;
+    const summary = stripHtml(rawSummary);
+    const multi = !isMovie && eps.length > 1;
+    const statusCls = /running|released/i.test(show.status) ? 'running' : /ended/i.test(show.status) ? 'ended' : 'tbd';
+    const epArg = isMovie ? null : first;
+    const { primary, isNew } = groupBadges(g);
+    const isHidden = Boolean(show.hidden);
+    const extUrl = (det && !multi && det.episodeUrl) || (multi || isMovie ? show.url : first.url || show.url);
+
+    $('#modalBody').innerHTML = `
+      <div class="m-hero">
+        <div class="m-hero-bg" id="modalHeroBg" style="background-image:url('${esc(heroImg)}')"></div>
+        <div class="m-hero-inner">
+          ${show.poster ? `<img class="m-poster" src="${esc(show.poster)}" alt="">` : ''}
+          <div>
+            ${show.logo ? `<img class="m-logo" src="${esc(show.logo)}" alt="${esc(show.name)} logo">` : ''}
+            <h2 class="m-show" id="modalTitle">${esc(show.name)}</h2>
+            ${show.originalName ? `<div class="m-orig">Original title: ${esc(show.originalName)}</div>` : ''}
+            <div class="m-ep">${
+              isMovie
+                ? `<span class="code">${esc((show.premiered || first.airdate || '').slice(0, 4) || 'Movie')}</span>${esc(show.tagline || (src.kind === 'tv' ? 'TV Movie Release' : src.kind === 'physical' ? 'Physical Media Release (Blu-ray / DVD)' : 'Digital / Streaming Release'))}`
+                : multi
+                ? `<span class="code">${esc(epCode(first))} – ${esc(epCode(eps[eps.length - 1]))}</span>${eps.length} episodes`
+                : `<span class="code">${esc(epCode(first))}</span>${esc(first.name || 'TBA')}`
+            }</div>
+          </div>
+        </div>
+      </div>
+      <div class="m-content">
+        <div class="m-facts">
+          ${primary ? evPillHtml(primary, false) : ''}
+          ${isNew ? '<span class="ev-pill new">New</span>' : ''}
+          ${srcBadge(src.name, src.kind)}
+          ${!isMovie && show.network && show.webChannel ? srcBadge(show.webChannel.name, 'stream') : ''}
+          <span class="fact">${ICON.cal}${esc(localWhen)}</span>
+          ${networkWhen ? `<span class="fact">${ICON.globe}${esc(networkWhen)}</span>` : ''}
+          ${first.runtime || show.runtime ? `<span class="fact">${ICON.clock}${first.runtime || show.runtime} min</span>` : ''}
+          ${show.rating ? `<span class="fact">${ICON.star}${show.rating}</span>` : ''}
+          <span class="fact"><span class="status-dot ${statusCls}"></span>${esc(show.status || '')}</span>
+          ${isHidden ? '<span class="hidden-pill">Hidden</span>' : ''}
+          ${(show.genres || []).slice(0, 3).map((gr, idx) => {
+            const hit = interestSet().has(gr);
+            const bounce = hit && primary && (primary.cls === 'series-prem' || primary.cls === 'season-prem');
+            return `<button class="fact fact-btn${hit ? ' interest-hit' : ''}${bounce ? ' bounce' : ''}"${bounce ? ` style="animation-delay:${idx * 110}ms"` : ''} type="button" data-genre="${esc(gr)}" title="${hit ? `My interest · click to filter by ${esc(gr)}` : `Filter calendar by ${esc(gr)}`}">${esc(gr)}</button>`;
+          }).join('')}
+        </div>
+        ${
+          multi
+            ? `<ul class="m-eplist">${eps
+                .map((e) => {
+                  const eb = epEventBadge(e);
+                  return `<li class="${e.watched ? 'seen' : ''}"><button class="ep-mini-chk${e.watched ? ' on' : ''}" type="button" data-modal-ep="${e.id}" title="${e.watched ? 'Mark unwatched' : 'Mark watched'}">${ICON.check}</button><span class="code">${esc(epCode(e))}</span><span class="m-eptitle">${esc(e.name || 'TBA')}</span>${eb ? evPillHtml(eb, true) : ''}${extSearchBtnHtml(show, e)}</li>`;
+                })
+                .join('')}</ul>`
+            : ''
+        }
+        <p class="m-summary" id="modalSummary"${summary ? '' : ' hidden'}>${esc(summary)}</p>
+        <div class="m-actions">
+          ${
+            extSearchUrl(show, epArg)
+              ? `<a class="btn btn-ext" id="modalExtSearchLink" href="${esc(extSearchUrl(show, epArg))}" target="_blank" rel="noopener noreferrer">${ICON.search} External Search</a>`
+              : `<button class="btn btn-ghost" id="modalExtSetupBtn" type="button">${ICON.search} Configure External Search</button>`
+          }
+          <button class="btn btn-watch${groupWatchInfo(g).allDone ? ' on' : ''}" id="modalWatch" type="button" aria-pressed="${groupWatchInfo(g).allDone}">${ICON.check} <span>${groupWatchInfo(g).allDone ? 'Watched' : 'Mark watched'}</span></button>
+          <button class="btn btn-fav${show.favorite ? ' on' : ''}" id="modalFav" type="button" aria-pressed="${Boolean(show.favorite)}">${show.favorite ? ICON.star : ICON.starOutline} <span>${show.favorite ? 'Favorited' : 'Favorite'}</span></button>
+          <button class="btn btn-ghost" id="modalGraxoboltBtn" type="button">⚡ Explore in Graxobolt</button>
+          <a class="btn btn-ghost" id="modalExtLink" href="${esc(extUrl)}" target="_blank" rel="noopener noreferrer">${ICON.ext} ${isMovie ? 'TMDB' : 'TVmaze'}</a>
+          ${show.imdbUrl ? `<a class="btn btn-ghost" href="${esc(show.imdbUrl)}" target="_blank" rel="noopener noreferrer">${ICON.ext} IMDb</a>` : ''}
+          ${show.officialSite ? `<a class="btn btn-ghost" href="${esc(show.officialSite)}" target="_blank" rel="noopener noreferrer">${ICON.globe} Official site</a>` : ''}
+          ${
+            isHidden
+              ? `<button class="btn" id="modalUnhide" type="button">${ICON.eye} Unhide ${isMovie ? 'movie' : 'show'}</button>`
+              : `<button class="btn btn-danger" id="modalHide" type="button">${ICON.eyeOff} Hide ${isMovie ? 'movie' : 'show'}</button>`
+          }
+        </div>
+        <div class="m-rich" id="modalRich"></div>
+        <div class="m-ext-custom">
+          <span>External search query: <b id="modalExtPreview">${esc(extSearchQuery(show, epArg))}</b></span>
+          <input id="modalExtInput" type="text" value="${esc(show.extQuery || '')}" placeholder="Override search title" />
+          <button class="btn btn-small btn-ghost" id="modalExtSave" type="button">Save</button>
+          ${show.extQuery ? '<button class="btn btn-small btn-ghost" id="modalExtReset" type="button">Reset</button>' : ''}
+        </div>
+      </div>`;
+    $('#modal').hidden = false;
+    document.body.style.overflow = 'hidden';
+
+    $('#modalExtSetupBtn')?.addEventListener('click', () => {
+      closeModal();
+      openDrawer('feeds');
+      requestAnimationFrame(() => $('#extUrlInput')?.focus());
+    });
+    $('#modalGraxoboltBtn')?.addEventListener('click', () => {
+      closeModal();
+      openGraxobolt({
+        seedKind: isMovie ? 'movie' : 'show',
+        seedId: isMovie ? null : show.id,
+        seedTmdbId: isMovie ? show.id : null,
+        seedName: show.name,
+      });
+    });
+
+    mountModalRichDetails({
+      kind,
+      id: show.id,
+      tvmazeId: isMovie ? null : show.id,
+      tmdbId: isMovie ? show.id : null,
+      imdbId: (show.externals && show.externals.imdb) || null,
+      name: show.name,
+      year: (show.premiered || '').slice(0, 4),
+      existingSummary: summary,
+      richEl: $('#modalRich'),
+      seq,
+    });
+
+    if (!det) {
+      const q = !isMovie && eps.length === 1 ? `?epId=${first.id}` : '';
+      api(`/api/item/${kind}/${show.id}${q}`)
+        .then((d) => {
+          detailCache.set(cacheKey, d);
+          if (detailCache.size > 40) detailCache.delete(detailCache.keys().next().value);
+          if (seq !== modalSeq || $('#modal').hidden) return;
+          const bg = d.background || d.posterLarge;
+          if (bg && !show.background && !show.banner) {
+            const bgEl = $('#modalHeroBg');
+            if (bgEl) bgEl.style.backgroundImage = `url('${bg.replace(/'/g, '%27')}')`;
+          }
+          const txt = stripHtml(!isMovie && eps.length === 1 && d.episodeSummary ? d.episodeSummary : d.summary);
+          const sumEl = $('#modalSummary');
+          if (sumEl && txt) {
+            sumEl.textContent = txt;
+            sumEl.hidden = false;
+          }
+          const extEl = $('#modalExtLink');
+          if (extEl && !multi && d.episodeUrl) extEl.href = d.episodeUrl;
+        })
+        .catch(() => {});
+    }
+    const saveExtOverride = (val) => {
+      const clean = String(val || '').trim().slice(0, 120);
+      const lib = window.ViuhtiClient.getLib();
+      if (isMovie) {
+        if (clean) lib.extQueryMovie[String(show.id)] = clean;
+        else delete lib.extQueryMovie[String(show.id)];
+      } else {
+        if (clean) lib.extQueryShow[String(show.id)] = clean;
+        else delete lib.extQueryShow[String(show.id)];
+      }
+      window.ViuhtiClient.saveLib(lib);
+      show.extQuery = clean || null;
+      const item = (isMovie ? state.movies : state.shows).get(show.id);
+      if (item) item.extQuery = clean || null;
+      $('#modalExtPreview').textContent = extSearchQuery(show, epArg);
+      const linkEl = $('#modalExtSearchLink');
+      if (linkEl) linkEl.href = extSearchUrl(show, epArg) || '#';
+      renderCalendar();
+      toast(clean ? 'Saved custom External Search query locally' : 'Reset External Search query', 'ok');
+    };
+    $('#modalExtSave').addEventListener('click', () => saveExtOverride($('#modalExtInput').value));
+    const resetBtn = $('#modalExtReset');
+    if (resetBtn) resetBtn.addEventListener('click', () => { $('#modalExtInput').value = ''; saveExtOverride(''); });
+    $('#modalWatch').addEventListener('click', async () => {
+      const next = !groupWatchInfo(g).allDone;
+      const entries = isMovie ? [{ kind: 'movie', id: show.id }] : eps.map((e) => ({ kind: 'episode', id: e.id }));
+      const ok = await setWatchedItems(entries, next);
+      if (!ok) return;
+      const w = groupWatchInfo(g);
+      const b = $('#modalWatch');
+      b.classList.toggle('on', w.allDone);
+      b.setAttribute('aria-pressed', String(w.allDone));
+      b.innerHTML = `${ICON.check} <span>${w.allDone ? 'Watched' : 'Mark watched'}</span>`;
+      $$('.ep-mini-chk[data-modal-ep]', $('#modalBody')).forEach((btn) => {
+        btn.classList.toggle('on', w.allDone);
+        btn.closest('li')?.classList.toggle('seen', w.allDone);
+      });
+    });
+    $$('.ep-mini-chk[data-modal-ep]', $('#modalBody')).forEach((btn) =>
+      btn.addEventListener('click', async () => {
+        const epId = Number(btn.dataset.modalEp);
+        const epObj = eps.find((e) => e.id === epId);
+        if (!epObj) return;
+        const next = !epObj.watched;
+        const ok = await setWatchedItems([{ kind: 'episode', id: epId }], next);
+        if (!ok) return;
+        btn.classList.toggle('on', next);
+        btn.closest('li')?.classList.toggle('seen', next);
+        const w = groupWatchInfo(g);
+        const mb = $('#modalWatch');
+        if (mb) {
+          mb.classList.toggle('on', w.allDone);
+          mb.setAttribute('aria-pressed', String(w.allDone));
+          mb.innerHTML = `${ICON.check} <span>${w.allDone ? 'Watched' : 'Mark watched'}</span>`;
+        }
+      })
+    );
+    $('#modalFav').addEventListener('click', async () => {
+      const fav = await toggleFavorite(show.id, kind);
+      if (fav === null) return;
+      const b = $('#modalFav');
+      b.classList.toggle('on', fav);
+      b.setAttribute('aria-pressed', String(fav));
+      b.innerHTML = `${fav ? ICON.star : ICON.starOutline} <span>${fav ? 'Favorited' : 'Favorite'}</span>`;
+    });
+    $('#modalHide')?.addEventListener('click', async () => {
+      closeModal();
+      await hideItem(show.id, show.name, kind);
+    });
+    $('#modalUnhide')?.addEventListener('click', async () => {
+      closeModal();
+      await unhideItem(show.id, show.name, kind);
+    });
+    $$('.fact-btn[data-genre]', $('#modalBody')).forEach((b) =>
+      b.addEventListener('click', () => {
+        setGenre(b.dataset.genre);
+        closeModal();
+      })
+    );
+    $('.modal-close').focus();
+  }
+  function closeModal() {
+    modalSeq++;
+    richAbort?.abort();
+    spotAbort?.abort();
+    $('#modal').hidden = true;
+    $('.modal-card')?.classList.remove('wide');
+    document.body.style.overflow = '';
+  }
+
+  // ---------- Show & movie management ----------
+  const pendingRemovals = new Set();
+
+  async function addItem(id, name, kind = 'show') {
+    id = Number(id);
+    try {
+      const added = await api(kind === 'movie' ? '/api/movies' : '/api/shows', { method: 'POST', body: JSON.stringify({ id }) });
+      const lib = window.ViuhtiClient.getLib();
+      if (kind === 'movie') {
+        delete lib.hiddenMovies[String(id)];
+        lib.addedMovies[String(id)] = { id, source: 'search', addedAt: Date.now() };
+      } else {
+        delete lib.hiddenShows[String(id)];
+        lib.addedShows[String(id)] = { id, source: 'search', addedAt: Date.now() };
+      }
+      window.ViuhtiClient.saveLib(lib);
+      if (added && added.id) {
+        if (kind === 'movie' && !rawServerMovies.some((m) => m.id === id)) rawServerMovies.push(added);
+        if (kind !== 'movie' && !rawServerShows.some((s) => s.id === id)) rawServerShows.push(added);
+      }
+      toast(`Added ${name}`, 'ok');
+      await reloadAll();
+      return true;
+    } catch (e) {
+      toast(e.message, 'err');
+      return false;
+    }
+  }
+  function applyLocalHide(id, kind) {
+    id = Number(id);
+    if (kind === 'movie') {
+      state.movies.delete(id);
+      state.movieEvents = state.movieEvents.filter((m) => m.movieId !== id);
+    } else {
+      state.shows.delete(id);
+      state.episodes = state.episodes.filter((e) => e.showId !== id);
+    }
+    $('#movieCount').textContent = [...state.movies.values()].filter((m) => !m.hidden).length;
+    updateFavUi();
+    populateGenres();
+    populateChannels();
+    renderCalendar();
+    renderHiddenDrawer();
+  }
+
+  async function setWatchedItems(entries, nextWatched) {
+    const lib = window.ViuhtiClient.getLib();
+    const epSet = new Set(lib.watchedEp);
+    const mvSet = new Set(lib.watchedMv);
+    const changedEp = new Set();
+    const changedMv = new Set();
+    for (const x of entries) {
+      const n = Number(x.id);
+      if (!n) continue;
+      if (x.kind === 'movie') {
+        changedMv.add(n);
+        if (nextWatched) mvSet.add(n);
+        else mvSet.delete(n);
+      } else {
+        changedEp.add(n);
+        if (nextWatched) epSet.add(n);
+        else epSet.delete(n);
+      }
+    }
+    lib.watchedEp = [...epSet];
+    lib.watchedMv = [...mvSet];
+    window.ViuhtiClient.saveLib(lib);
+    for (const e of state.episodes) if (changedEp.has(e.id)) e.watched = Boolean(nextWatched);
+    for (const me of state.movieEvents) if (changedMv.has(me.movieId)) me.watched = Boolean(nextWatched);
+    for (const id of changedMv) {
+      const m = state.movies.get(id);
+      if (m) m.watched = Boolean(nextWatched);
+    }
+    renderCalendar();
+    return true;
+  }
+
+  async function hideItem(id, name, kind = 'show') {
+    id = Number(id);
+    const key = `${kind}:${id}`;
+    if (pendingRemovals.has(key)) return;
+    pendingRemovals.add(key);
+    try {
+      const col = kind === 'movie' ? state.movies : state.shows;
+      const meta = col.get(id) || { id, name };
+      const lib = window.ViuhtiClient.getLib();
+      const entry = {
+        id,
+        kind,
+        name: meta.name || name || `${kind} #${id}`,
+        poster: meta.poster || null,
+        channelName: meta.channelName || null,
+        premiered: meta.premiered || null,
+        hiddenAt: Date.now(),
+      };
+      if (kind === 'movie') lib.hiddenMovies[String(id)] = entry;
+      else lib.hiddenShows[String(id)] = entry;
+      window.ViuhtiClient.saveLib(lib);
+      if (state.settings && state.settings.showHidden) {
+        await reloadAll();
+      } else {
+        applyLocalHide(id, kind);
+        refreshHidden();
+      }
+      toast(`Hid ${name}`, 'ok', { label: 'Undo', onClick: () => unhideItem(id, name, kind) });
+    } finally {
+      pendingRemovals.delete(key);
+    }
+  }
+
+  async function unhideItem(id, name, kind = 'show') {
+    id = Number(id);
+    const lib = window.ViuhtiClient.getLib();
+    if (kind === 'movie') delete lib.hiddenMovies[String(id)];
+    else delete lib.hiddenShows[String(id)];
+    window.ViuhtiClient.saveLib(lib);
+    toast(`Unhid ${name}`, 'ok');
+    await reloadAll();
+  }
+
+  async function toggleFavorite(id, kind = 'show') {
+    id = Number(id);
+    const col = kind === 'movie' ? state.movies : state.shows;
+    const s = col.get(id);
+    if (!s) return null;
+    const lib = window.ViuhtiClient.getLib();
+    const list = new Set(kind === 'movie' ? lib.favMovies : lib.favShows);
+    const next = !list.has(id);
+    if (next) list.add(id);
+    else list.delete(id);
+    if (kind === 'movie') lib.favMovies = [...list];
+    else lib.favShows = [...list];
+    window.ViuhtiClient.saveLib(lib);
+    s.favorite = next;
+    updateFavUi();
+    if (state.favoritesOnly) {
+      renderCalendar();
+    } else {
+      $$(`#calendar .fav-btn[data-fav="${id}"][data-kind="${kind}"]`).forEach((b) => {
+        b.classList.toggle('on', next);
+        b.setAttribute('aria-pressed', String(next));
+        b.title = next ? 'Remove from Favorites' : 'Mark as Favorite';
+        b.innerHTML = next ? ICON.star : ICON.starOutline;
+        const card = b.closest('.ep, .agenda-row');
+        if (card) card.classList.toggle('fav', next);
+      });
+    }
+    toast(next ? `Added ${s.name} to Favorites` : `Removed ${s.name} from Favorites`, 'ok');
+    return next;
+  }
+
+  // ---------- Search ----------
+  const searchInput = $('#searchInput');
+  const searchResults = $('#searchResults');
+  let searchTimer = null;
+  let searchSeq = 0;
+  let searchItems = [];
+  let activeIdx = -1;
+
+  function renderSearch(items, q) {
+    searchItems = items;
+    activeIdx = items.length ? 0 : -1;
+    if (!items.length) {
+      searchResults.innerHTML = `<div class="sr-empty">No shows or movies found for “${esc(q)}”</div>`;
+    } else {
+      searchResults.innerHTML =
+        items
+          .map((s, i) => {
+            const isMovie = s.kind === 'movie';
+            const src = sourceOf(s);
+            const year = s.premiered ? s.premiered.slice(0, 4) : '';
+            return `
+          <div class="sr-item${i === 0 ? ' active' : ''}" data-idx="${i}" role="option">
+            ${s.poster ? `<img src="${esc(s.poster)}" alt="" loading="lazy">` : '<div class="ph"></div>'}
+            <div style="min-width:0">
+              <div class="sr-name">
+                ${esc(s.name)} ${year ? `<span class="year">(${year})</span>` : ''}
+                ${s.wordPool && s.wordPool.primary ? '<span class="wp-badge primary" title="Primary Strict Override*">★ Primary</span>' : ''}
+                ${s.fuzzyMatch || (s.wordPool && s.wordPool.fuzzy) ? `<span class="wp-badge fuzzy" title="${esc(s.fuzzySnippet ? `Fuzzy Match in ${s.fuzzyField}: ${s.fuzzySnippet}` : 'Fuzzy Match')}">Fuzzy Match</span>` : ''}
+              </div>
+              <div class="sr-meta">
+                ${isMovie ? '<span class="movie-pill">Movie</span>' : src.name !== 'Unknown' ? srcBadge(src.name, src.kind) : ''}
+                ${src.country ? `<span>${esc(src.country)}</span>` : ''}
+                <span><span class="status-dot ${/running|released/i.test(s.status) ? 'running' : /ended/i.test(s.status) ? 'ended' : 'tbd'}"></span> ${esc(s.status || '')}</span>
+                ${s.genres && s.genres.length ? `<span>· ${esc(s.genres.slice(0, 2).join(', '))}</span>` : ''}
+              </div>
+              ${s.fuzzySnippet ? `<div class="sr-summary"><b>Match (${esc(s.fuzzyField || 'text')}):</b> ${esc(s.fuzzySnippet)}</div>` : s.summary ? `<div class="sr-summary">${esc(stripHtml(s.summary))}</div>` : ''}
+            </div>
+            <div class="sr-acts">
+              <button class="sr-gb-btn" data-idx="${i}" type="button" title="Explore in Graxobolt">⚡ Graxobolt</button>
+              <button class="add-btn${s.onCalendar ? ' on' : s.hidden ? ' is-hidden' : ''}" data-id="${s.id}" data-kind="${isMovie ? 'movie' : 'show'}" type="button">${s.onCalendar ? '✓ On calendar' : s.hidden ? 'Unhide' : '+ Add'}</button>
+            </div>
+          </div>`;
+          })
+          .join('');
+    }
+    searchResults.hidden = false;
+  }
+
+  async function doSearch(q) {
+    const seq = ++searchSeq;
+    searchResults.hidden = false;
+    searchResults.innerHTML = '<div class="sr-empty"><span class="spinner" style="display:inline-block;vertical-align:-2px;margin-right:8px"></span>Searching shows &amp; movies…</div>';
+    try {
+      const items = await api(`/api/search?q=${encodeURIComponent(q)}`);
+      if (seq === searchSeq) {
+        const entries = window.ViuhtiClient.getWordPoolEntries();
+        const wpActive = entries.some((e) => e.enabled);
+        const enriched = (items || []).map((item) => {
+          const k = item.kind === 'movie' ? 'movie' : 'show';
+          const local = (k === 'movie' ? state.movies : state.shows).get(Number(item.id));
+          const wp = wpActive ? window.ViuhtiClient.matchWordPool(entries, item) : null;
+          return {
+            ...item,
+            onCalendar: Boolean(local && !local.hidden),
+            hidden: Boolean(local && local.hidden),
+            ...(wp && (wp.primary || wp.fuzzy) ? { wordPool: wp } : {}),
+          };
+        });
+        renderSearch(enriched, q);
+      }
+    } catch (e) {
+      if (seq === searchSeq) searchResults.innerHTML = `<div class="sr-empty">${esc(e.message)}</div>`;
+    }
+  }
+
+  async function toggleSearchItem(idx, btn) {
+    const s = searchItems[idx];
+    if (!s) return;
+    const kind = s.kind === 'movie' ? 'movie' : 'show';
+    btn = btn || $(`.add-btn[data-id="${s.id}"][data-kind="${kind}"]`, searchResults);
+    btn.disabled = true;
+    if (s.onCalendar) {
+      await hideItem(s.id, s.name, kind);
+      s.onCalendar = false;
+      s.hidden = true;
+    } else if (s.hidden) {
+      btn.textContent = 'Unhiding…';
+      await unhideItem(s.id, s.name, kind);
+      s.onCalendar = true;
+      s.hidden = false;
+    } else {
+      btn.textContent = 'Adding…';
+      if (await addItem(s.id, s.name, kind)) {
+        s.onCalendar = true;
+        s.hidden = false;
+      }
+    }
+    btn.disabled = false;
+    btn.classList.toggle('on', Boolean(s.onCalendar));
+    btn.classList.toggle('is-hidden', Boolean(s.hidden && !s.onCalendar));
+    btn.textContent = s.onCalendar ? '✓ On calendar' : s.hidden ? 'Unhide' : '+ Add';
+  }
+
+  searchInput.addEventListener('input', () => {
+    clearTimeout(searchTimer);
+    const q = searchInput.value.trim();
+    if (q.length < 2) {
+      searchResults.hidden = true;
+      return;
+    }
+    searchTimer = setTimeout(() => doSearch(q), 280);
+  });
+  function syncSearchState() {
+    for (const s of searchItems) {
+      const kind = s.kind === 'movie' ? 'movie' : 'show';
+      const entry = (kind === 'movie' ? state.movies : state.shows).get(s.id);
+      s.onCalendar = Boolean(entry && !entry.hidden);
+      s.hidden = Boolean((entry && entry.hidden) || state.hiddenItems.some((h) => h.id === s.id && h.kind === kind));
+      const btn = $(`.add-btn[data-id="${s.id}"][data-kind="${kind}"]`, searchResults);
+      if (btn) {
+        btn.classList.toggle('on', s.onCalendar);
+        btn.classList.toggle('is-hidden', s.hidden && !s.onCalendar);
+        btn.textContent = s.onCalendar ? '✓ On calendar' : s.hidden ? 'Unhide' : '+ Add';
+      }
+    }
+  }
+
+  searchInput.addEventListener('focus', () => {
+    if (searchInput.value.trim().length >= 2 && searchResults.innerHTML) {
+      syncSearchState();
+      searchResults.hidden = false;
+    }
+  });
+  searchInput.addEventListener('keydown', (e) => {
+    const items = $$('.sr-item', searchResults);
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      if (!items.length) return;
+      e.preventDefault();
+      activeIdx = (activeIdx + (e.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+      items.forEach((el, i) => el.classList.toggle('active', i === activeIdx));
+      items[activeIdx].scrollIntoView({ block: 'nearest' });
+    } else if (e.key === 'Enter' && activeIdx >= 0) {
+      e.preventDefault();
+      toggleSearchItem(activeIdx);
+    } else if (e.key === 'Escape') {
+      searchResults.hidden = true;
+      searchInput.blur();
+    }
+  });
+  searchResults.addEventListener('click', async (e) => {
+    const gb = e.target.closest('.sr-gb-btn');
+    if (gb) {
+      const s = searchItems[Number(gb.dataset.idx)];
+      if (s) {
+        searchResults.hidden = true;
+        openGraxobolt({
+          seedKind: s.kind === 'movie' ? 'movie' : 'show',
+          seedId: s.kind === 'movie' ? null : s.id,
+          seedTmdbId: s.kind === 'movie' ? s.id : null,
+          seedName: s.name,
+        });
+      }
+      return;
+    }
+    const btn = e.target.closest('.add-btn');
+    if (btn) toggleSearchItem(Number(btn.closest('.sr-item').dataset.idx), btn);
+  });
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('#searchBox')) searchResults.hidden = true;
+  });
+
+  // ---------- Control Center (Word Pool, Preferences, Sync, Alerts, Feeds & Hidden) ----------
+  const VALID_CC_TABS = new Set(['wordpool', 'appearance', 'sync', 'alerts', 'feeds', 'hidden']);
+  let wpComposerMode = 'primary';
+
+  function setDrawerTab(tab) {
+    const mapped = tab === 'settings' ? 'wordpool' : tab;
+    const next = VALID_CC_TABS.has(mapped) ? mapped : 'wordpool';
+    state.drawerMedia = next;
+    $$('#ccNav [data-cc-tab]').forEach((x) => {
+      const on = x.dataset.ccTab === next;
+      x.classList.toggle('on', on);
+      x.setAttribute('aria-selected', String(on));
+    });
+    $$('#ccPanels [data-cc-panel]').forEach((p) => {
+      p.hidden = p.dataset.ccPanel !== next;
+    });
+    $('#drawer').classList.toggle('drawer-in-hidden', next === 'hidden');
+    if (next === 'wordpool' && !state.wordpool.loaded) loadWordPool(true);
+    updateHiddenUi();
+    renderHiddenDrawer();
+  }
+
+  function renderWordPoolSettings() {
+    const box = $('#wordPoolBox');
+    if (!box) return;
+    const entries = state.wordpool.entries || [];
+    const stats = state.wordpool.stats || { total: 0, active: 0, primary: 0, fuzzy: 0, exclude: 0 };
+    const suggestions = state.wordpool.suggestions || [];
+
+    box.innerHTML = `
+      <div class="wp-header">
+        <div>
+          <div class="api-keys-head">
+            <span class="lan-label">Word Pool Enrichment &amp; Override Engine</span>
+            <span class="api-key-badge ${stats.active ? 'ok' : 'muted'}">${stats.active} Active</span>
+          </div>
+          <p class="wp-lead">Add actors, creators, themes, or mentions (such as <b>Gordon Ramsay</b> or <b>Scrubs</b>) to match locally across cached TVmaze, TMDB &amp; Wikipedia dossiers with zero extra polling.</p>
+        </div>
+        <div class="wp-stats-row">
+          <span class="wp-badge primary">★ ${stats.primary} Primary*</span>
+          <span class="wp-badge fuzzy">${stats.fuzzy} Fuzzy Match</span>
+          <span class="wp-badge exclude">${stats.exclude} NO Exclude</span>
+        </div>
+      </div>
+
+      <form class="wp-form" id="wpAddForm">
+        <div class="wp-mode-seg" role="group" aria-label="Word Pool matching mode">
+          <button type="button" class="wp-mode-btn${wpComposerMode === 'primary' ? ' on primary' : ''}" data-wp-mode="primary">★ Primary Override* (Strict)</button>
+          <button type="button" class="wp-mode-btn${wpComposerMode === 'fuzzy' ? ' on fuzzy' : ''}" data-wp-mode="fuzzy">Fuzzy Match</button>
+          <button type="button" class="wp-mode-btn${wpComposerMode === 'exclude' ? ' on exclude' : ''}" data-wp-mode="exclude">NO Exclude</button>
+        </div>
+        <div class="wp-input-row">
+          <input id="wpTermInput" type="text" autocomplete="off" spellcheck="false" placeholder="Term or phrase (supports: detective NO reality)…" aria-label="Word Pool term" required />
+          <button type="submit" class="btn btn-small" id="wpAddBtn">+ Add Rule</button>
+        </div>
+        <div class="wp-extra-row">
+          <input id="wpAliasesInput" type="text" autocomplete="off" spellcheck="false" placeholder="Optional aliases (comma-separated)…" aria-label="Optional aliases" />
+          <input id="wpExcludesInput" type="text" autocomplete="off" spellcheck="false" placeholder="Optional NO exclusions (e.g. reality, clip show)…" aria-label="Optional NO exclusions" />
+        </div>
+        <div class="wp-footnote">
+          <b>*Primary Override scope:</b> Strict whole-word/phrase match (no typo slop) that overrides Auto-Sync filters, Discover lens/score penalties, and Calendar filters so matching titles always appear (user-Hidden shows remain blocked unless unhidden).<br>
+          <b>Fuzzy Match:</b> Typo-tolerant &amp; mention matcher (catches casual mentions like <code>gordon ramsey</code> or typos like <code>sceubs</code> → <i>Scrubs</i>) labeled uniformly as <span class="wp-badge fuzzy">Fuzzy Match</span>.
+        </div>
+      </form>
+
+      ${
+        suggestions.length
+          ? `<div class="wp-suggest-sec">
+              <div class="lan-label">Suggested from Your Library &amp; Cached Lore (click to add)</div>
+              <div class="wp-suggest-chips">
+                ${suggestions
+                  .slice(0, 12)
+                  .map(
+                    (s) =>
+                      `<button type="button" class="gchip wp-sug-chip" data-wp-suggest="${esc(s.term)}" title="Score ${s.score} · Add to Word Pool as ${wpComposerMode === 'primary' ? 'Primary*' : wpComposerMode === 'exclude' ? 'NO Exclude' : 'Fuzzy Match'}">+ ${esc(s.term)}</button>`
+                  )
+                  .join('')}
+              </div>
+            </div>`
+          : ''
+      }
+
+      <div class="wp-list-sec">
+        <div class="api-keys-head">
+          <span class="lan-label">Configured Word Rules (${entries.length})</span>
+        </div>
+        ${
+          entries.length
+            ? `<ul class="wp-list">
+                ${entries
+                  .map(
+                    (e) => `
+                  <li class="wp-item${e.enabled ? '' : ' is-off'}" data-wp-id="${esc(e.id)}">
+                    <label class="switch" title="${e.enabled ? 'Disable rule' : 'Enable rule'}">
+                      <input type="checkbox" class="wp-toggle-chk" data-wp-toggle="${esc(e.id)}"${e.enabled ? ' checked' : ''} />
+                      <span class="switch-track"></span>
+                    </label>
+                    <div class="wp-item-main">
+                      <div class="wp-item-top">
+                        <span class="wp-term">${esc(e.term)}</span>
+                        <span class="wp-badge ${esc(e.mode)}">${e.mode === 'primary' ? '★ Primary Override*' : e.mode === 'exclude' ? 'NO Exclude' : 'Fuzzy Match'}</span>
+                      </div>
+                      ${
+                        (e.aliases && e.aliases.length) || (e.excludeTerms && e.excludeTerms.length)
+                          ? `<div class="wp-item-sub">
+                              ${e.aliases && e.aliases.length ? `<span><b>Aliases:</b> ${esc(e.aliases.join(', '))}</span>` : ''}
+                              ${e.excludeTerms && e.excludeTerms.length ? `<span><b>NO:</b> ${esc(e.excludeTerms.join(', '))}</span>` : ''}
+                            </div>`
+                          : ''
+                      }
+                    </div>
+                    <button type="button" class="icon-btn wp-del-btn" data-wp-del="${esc(e.id)}" title="Remove rule" aria-label="Remove ${esc(e.term)}">×</button>
+                  </li>`
+                  )
+                  .join('')}
+              </ul>`
+            : `<div class="sr-empty">No Word Pool rules yet — add a <b>Primary Override*</b> (strict) or <b>Fuzzy Match</b> above, or click a local suggestion.</div>`
+        }
+      </div>`;
+
+    const applyWordPoolResponse = async (res, msg) => {
+      state.wordpool = {
+        entries: res.entries || [],
+        stats: res.stats || { total: 0, active: 0, primary: 0, fuzzy: 0, exclude: 0 },
+        suggestions: res.suggestions || state.wordpool.suggestions || [],
+        loaded: true,
+      };
+      updateWordPoolCounters();
+      renderWordPoolSettings();
+      renderHiddenDrawer();
+      if (msg) toast(msg, 'ok');
+      await reloadAll();
+      if (state.tab === 'discover') loadDiscover(false);
+      if (gbController) gbController.loadTaste();
+    };
+
+    $$('[data-wp-mode]', box).forEach((b) =>
+      b.addEventListener('click', () => {
+        wpComposerMode = b.dataset.wpMode;
+        renderWordPoolSettings();
+        $('#wpTermInput', box)?.focus();
+      })
+    );
+
+    const applyLocalWordPoolChange = async (msg) => {
+      applyClientWordPoolAndLibrary();
+      const vr = viewRange();
+      const overlaid = window.ViuhtiClient.applyToSchedule(
+        rawServerEpisodes,
+        rawServerMovieEvents,
+        state.shows,
+        state.movies,
+        null,
+        vr.fetchFrom,
+        vr.fetchTo,
+        { includeHidden: Boolean(state.settings.showHidden) }
+      );
+      state.episodes = overlaid.episodes;
+      state.movieEvents = overlaid.movies;
+      renderWordPoolSettings();
+      renderCalendar();
+      if (state.tab === 'discover') loadDiscover(false);
+      toast(msg, 'ok');
+    };
+
+    $('#wpAddForm', box)?.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const term = $('#wpTermInput', box).value.trim();
+      if (!term) return;
+      const aliases = $('#wpAliasesInput', box).value.trim();
+      const excludeTerms = $('#wpExcludesInput', box).value.trim();
+      const entry = window.ViuhtiClient.sanitizeEntry({ term, mode: wpComposerMode, aliases, excludeTerms });
+      if (!entry) return toast('Enter at least 2 characters for Word Pool rule', 'err');
+      const entries = [entry, ...window.ViuhtiClient.getWordPoolEntries()];
+      window.ViuhtiClient.saveWordPoolEntries(entries);
+      await applyLocalWordPoolChange(`Added ${wpComposerMode === 'primary' ? 'Primary*' : wpComposerMode === 'exclude' ? 'NO Exclude' : 'Fuzzy Match'} rule "${entry.term}"`);
+    });
+
+    $$('[data-wp-suggest]', box).forEach((b) =>
+      b.addEventListener('click', async () => {
+        const term = b.dataset.wpSuggest;
+        const entry = window.ViuhtiClient.sanitizeEntry({ term, mode: wpComposerMode });
+        if (!entry) return;
+        const entries = [entry, ...window.ViuhtiClient.getWordPoolEntries()];
+        window.ViuhtiClient.saveWordPoolEntries(entries);
+        await applyLocalWordPoolChange(`Added "${entry.term}" to Word Pool`);
+      })
+    );
+
+    $$('[data-wp-toggle]', box).forEach((chk) =>
+      chk.addEventListener('change', async () => {
+        const entries = window.ViuhtiClient.getWordPoolEntries().map((e) =>
+          e.id === chk.dataset.wpToggle ? { ...e, enabled: chk.checked, updatedAt: Date.now() } : e
+        );
+        window.ViuhtiClient.saveWordPoolEntries(entries);
+        await applyLocalWordPoolChange(chk.checked ? 'Word Pool rule enabled' : 'Word Pool rule paused');
+      })
+    );
+
+    $$('[data-wp-del]', box).forEach((b) =>
+      b.addEventListener('click', async () => {
+        const entries = window.ViuhtiClient.getWordPoolEntries().filter((e) => e.id !== b.dataset.wpDel);
+        window.ViuhtiClient.saveWordPoolEntries(entries);
+        await applyLocalWordPoolChange('Removed Word Pool rule');
+      })
+    );
+  }
+
+  function openDrawer(tab = null) {
+    $('#drawer').classList.add('open');
+    $('#drawer').setAttribute('aria-hidden', 'false');
+    $('#drawerScrim').hidden = false;
+    loadWordPool(true);
+    renderWordPoolSettings();
+    renderThemeSettings(state.settings);
+    renderApiKeysSettings(state.settings);
+    renderInterestsSettings();
+    renderHiddenSettings(state.settings);
+    renderDigestBox(state.status && state.status.digest);
+    renderAlertsSettings(state.settings);
+    renderBackupSettings();
+    renderExtSettings(state.settings);
+    if (state.status) {
+      renderDiscovery(state.status.discovery, state.status.movieDiscovery);
+    } else {
+      pollStatus();
+    }
+    setDrawerTab(tab || state.drawerMedia || 'wordpool');
+  }
+  function closeDrawer() {
+    $('#drawer').classList.remove('open');
+    $('#drawer').setAttribute('aria-hidden', 'true');
+    $('#drawerScrim').hidden = true;
+    $('#showList').innerHTML = '';
+  }
+
+  function relAgo(ts) {
+    if (!ts) return '';
+    const sec = Math.max(0, Math.round((Date.now() - ts) / 1000));
+    if (sec < 60) return 'just now';
+    const min = Math.round(sec / 60);
+    if (min < 60) return `${min}m ago`;
+    const hr = Math.round(min / 60);
+    if (hr < 24) return `${hr}h ago`;
+    const days = Math.round(hr / 24);
+    return `${days}d ago`;
+  }
+
+  function renderHiddenList(list, q) {
+    let items = [...state.hiddenItems];
+    if (q) {
+      items = items.filter(
+        (x) =>
+          (x.name || '').toLowerCase().includes(q) ||
+          (x.channelName || '').toLowerCase().includes(q) ||
+          (x.kind || '').toLowerCase().includes(q)
+      );
+    }
+    $('#drawerSub').textContent = `${state.hiddenItems.length} hidden item${state.hiddenItems.length === 1 ? '' : 's'} · Skipped by updates`;
+    if (!items.length) {
+      list.innerHTML = `<li class="sr-empty">${state.hiddenItems.length ? 'No matching hidden items' : 'No hidden shows or movies yet. Hide any title from the calendar to keep it out of your personal schedule.'}</li>`;
+      return;
+    }
+    list.innerHTML = items
+      .slice(0, 200)
+      .map((x) => {
+        const isMovie = x.kind === 'movie';
+        const thumb = isMovie && x.background
+          ? `<img src="${esc(x.background)}" alt="" loading="lazy">`
+          : x.logo
+          ? wideArtHtml(x.logo)
+          : x.banner
+          ? wideArtHtml(x.banner)
+          : x.poster
+          ? `<img class="poster" src="${esc(x.poster)}" alt="" loading="lazy">`
+          : '';
+        const srcName = x.channelName || (isMovie ? 'Movie' : 'TV');
+        const when = relAgo(x.hiddenAt);
+        return `
+        <li class="show-item hidden-item">
+          <div class="show-thumb" style="background:${brandColor(srcName)}33">${thumb}</div>
+          <div style="min-width:0">
+            <div class="show-name" title="${esc(x.name)}">${esc(x.name)}</div>
+            <div class="show-meta">
+              <span class="ev-pill ${isMovie ? 'movie' : 'special'}">${isMovie ? 'Movie' : 'TV Show'}</span>
+              ${x.channelName ? srcBadge(x.channelName, x.channelKind || 'tv') : ''}
+              ${x.favorite ? `<span class="fav-ind" title="Favorited">${ICON.star}</span>` : ''}
+            </div>
+            <div class="show-next">Hidden${when ? ` · ${esc(when)}` : ''}</div>
+          </div>
+          <div class="show-actions hidden-actions">
+            <button class="restore-btn" type="button" data-hidden-unhide="${x.id}" data-kind="${x.kind}" data-name="${esc(x.name)}" title="Unhide ${esc(x.name)}">${ICON.eye}<span>Unhide</span></button>
+          </div>
+        </li>`;
+      })
+      .join('') + (items.length > 200 ? `<li class="sr-empty">Showing first 200 of ${items.length} hidden items — type above to filter.</li>` : '');
+  }
+
+  function renderHiddenDrawer() {
+    if (!$('#drawer').classList.contains('open')) return;
+    $('#drawer').classList.toggle('drawer-in-hidden', state.drawerMedia === 'hidden');
+    updateHiddenUi();
+    const list = $('#showList');
+    if (state.drawerMedia !== 'hidden') {
+      list.innerHTML = '';
+      const activeShowCount = [...state.shows.values()].filter((s) => !s.hidden).length;
+      const activeMovieCount = [...state.movies.values()].filter((m) => !m.hidden).length;
+      const wpActive = (state.wordpool && state.wordpool.stats && state.wordpool.stats.active) || 0;
+      $('#drawerSub').textContent = `${activeShowCount} show${activeShowCount === 1 ? '' : 's'} · ${activeMovieCount} movie${activeMovieCount === 1 ? '' : 's'} · ${wpActive} word rule${wpActive === 1 ? '' : 's'} · ${state.hiddenItems.length} hidden`;
+      return;
+    }
+    const q = $('#showFilter').value.trim().toLowerCase();
+    renderHiddenList(list, q);
+  }
+
+  $('#showList').addEventListener('click', async (e) => {
+    const unhideBtn = e.target.closest('[data-hidden-unhide]');
+    if (unhideBtn) {
+      if (unhideBtn.disabled) return;
+      unhideBtn.disabled = true;
+      await unhideItem(Number(unhideBtn.dataset.hiddenUnhide), unhideBtn.dataset.name || 'item', unhideBtn.dataset.kind || 'show');
+    }
+  });
+  $$('#ccNav [data-cc-tab]').forEach((b) =>
+    b.addEventListener('click', () => setDrawerTab(b.dataset.ccTab))
+  );
+  $('#showFilter').addEventListener('input', renderHiddenDrawer);
+  $('#myShowsBtn').addEventListener('click', () => openDrawer(state.drawerMedia === 'hidden' ? 'wordpool' : state.drawerMedia));
+  $('#hiddenTopBtn').addEventListener('click', () => openDrawer('hidden'));
+  $('#drawerClose').addEventListener('click', closeDrawer);
+  $('#drawerScrim').addEventListener('click', closeDrawer);
+
+  // ---------- Sync & settings ----------
+  $('#refreshBtn').addEventListener('click', async () => {
+    await api('/api/refresh', { method: 'POST' });
+    toast('Syncing shared catalog & refreshing your calendar…', 'ok');
+    pollStatus(true);
+  });
+
+  let pollTimer = null;
+  let lastProgress = '';
+  let wasBusy = false;
+  let lastReload = 0;
+
+  async function pollStatus(soon = false) {
+    clearTimeout(pollTimer);
+    if (soon) await new Promise((r) => setTimeout(r, 400));
+    let busy = false;
+    try {
+      const st = await api('/api/status');
+      state.status = st;
+      const sync = st.sync;
+      const disc = st.discovery;
+      const mdisc = st.movieDiscovery;
+      const recJob = st.discover;
+      busy = sync.running || Boolean(disc && disc.running) || Boolean(mdisc && mdisc.running) || Boolean(recJob && recJob.running);
+
+      const pill = $('#syncPill');
+      pill.hidden = !busy;
+      if (recJob && recJob.running) $('#syncText').textContent = recJob.phase || `Deep scan ${recJob.done}/${recJob.total || '…'}`;
+      else if (disc && disc.running) $('#syncText').textContent = `Syncing shows ${disc.done}/${disc.total || '…'}`;
+      else if (mdisc && mdisc.running) $('#syncText').textContent = `Syncing movies ${mdisc.done}/${mdisc.total || '…'}`;
+      else if (sync.running) $('#syncText').textContent = `Updating ${sync.done}/${sync.total}`;
+
+      const prevExtUrl = state.settings.extSearchUrl;
+      const prevInterests = JSON.stringify(state.settings.interests || []);
+      const prevKeys = JSON.stringify(state.settings.apiKeys || {});
+      const prevShowHidden = Boolean(state.settings.showHidden);
+      const prevHideWatched = Boolean(state.hideWatched);
+      syncSettingsFromServer(st.settings, false);
+      renderDigestBanner(st.digest);
+      maybeFireBrowserNotifications();
+      if (state.status && $('#drawer').classList.contains('open')) {
+        renderThemeSettings(state.settings);
+        renderApiKeysSettings(state.settings);
+        renderInterestsSettings();
+        renderHiddenSettings(state.settings);
+        renderDiscovery(disc, mdisc);
+        renderDigestBox(st.digest);
+        renderAlertsSettings(state.settings);
+        renderBackupSettings();
+        renderExtSettings(state.settings);
+      }
+      if (Boolean(state.settings.showHidden) !== prevShowHidden && state.showsLoaded) {
+        await reloadAll();
+      } else if (
+        (Boolean(state.hideWatched) !== prevHideWatched ||
+          state.settings.extSearchUrl !== prevExtUrl ||
+          JSON.stringify(state.settings.interests || []) !== prevInterests ||
+          JSON.stringify(state.settings.apiKeys || {}) !== prevKeys) &&
+        state.showsLoaded &&
+        state.loaded
+      ) {
+        renderCalendar();
+      }
+      if (state.showsLoaded && typeof st.hiddenCount === 'number' && st.hiddenCount !== state.hiddenItems.length) {
+        refreshHidden().catch(() => {});
+      }
+
+      const progress = `${sync.done}:${disc ? disc.done : 0}:${mdisc ? mdisc.done : 0}:${st.showCount || 0}:${st.moviesCount || 0}`;
+      if (busy && progress !== lastProgress && Date.now() - lastReload > 3000) {
+        lastProgress = progress;
+        lastReload = Date.now();
+        await reloadAll();
+      } else if (!busy && wasBusy) {
+        await reloadAll();
+        if ((disc && disc.finishedAt && Date.now() - disc.finishedAt < 15000) || (mdisc && mdisc.finishedAt && Date.now() - mdisc.finishedAt < 15000)) {
+          const tvN = (disc && disc.added && disc.added.length) || 0;
+          const mvN = (mdisc && mdisc.added && mdisc.added.length) || 0;
+          toast(`Sync complete: ${tvN} show${tvN === 1 ? '' : 's'}, ${mvN} movie${mvN === 1 ? '' : 's'} added`, 'ok');
+        }
+      } else if (state.showsLoaded && state.shows.size === 0 && state.movies.size === 0 && state.loaded) {
+        renderCalendar(); // refresh empty-state scan progress
+      }
+      if (recJob && recJob.running) {
+        state.discover.wasRunning = true;
+        if (state.tab === 'discover') {
+          const pEl = $('#discPhaseText');
+          if (pEl) pEl.textContent = recJob.phase || 'Analyzing Taste DNA…';
+        }
+      } else if (state.discover.wasRunning) {
+        state.discover.wasRunning = false;
+        if (state.tab === 'discover') {
+          await loadDiscover(false);
+          toast('Deep Dive recommendations updated', 'ok');
+        }
+      }
+      wasBusy = busy;
+    } catch {
+      /* server unreachable, retry later */
+    }
+    if (!document.hidden) pollTimer = setTimeout(pollStatus, busy ? 1500 : state.status?.publicMode ? 120000 : 60000);
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) clearTimeout(pollTimer);
+    else pollStatus();
+  });
+
+  function renderThemeSettings(settings) {
+    const box = $('#themeSettingsBox');
+    if (!box) return;
+    const activeId = normalizeTheme((settings && settings.style) || store.get('style', 'midnight'));
+    const cur = THEMES.find((t) => t.id === activeId) || THEMES[0];
+    box.hidden = false;
+    box.innerHTML = `
+      <div class="api-keys-head">
+        <span class="lan-label">Visual Style (10 Themes)</span>
+        <span class="api-key-badge muted">${esc(cur.name)} · ${esc(cur.mode)}</span>
+      </div>
+      <div class="theme-grid">
+        ${THEMES.map((t) => {
+          const on = t.id === activeId;
+          return `
+            <button type="button" class="theme-card${on ? ' active' : ''}" data-theme-pick="${t.id}" aria-pressed="${on}">
+              <div class="theme-swatches" style="background:${t.swatches[0]}">
+                <span class="theme-swatch-dot" style="background:${t.swatches[1]}"></span>
+                <span class="theme-swatch-dot" style="background:${t.swatches[2]}"></span>
+                <span class="theme-swatch-dot" style="background:${t.swatches[3]}"></span>
+                <span class="theme-mode-tag" style="color:${t.mode === 'Light' ? '#111' : '#fff'}">${esc(t.mode)}</span>
+              </div>
+              <div class="theme-card-name">${esc(t.name)}</div>
+              <div class="theme-card-sub">${esc(t.motif)}</div>
+            </button>`;
+        }).join('')}
+      </div>`;
+    $$('[data-theme-pick]', box).forEach((b) =>
+      b.addEventListener('click', () => {
+        const next = applyTheme(b.dataset.themePick);
+        state.settings = { ...state.settings, style: next };
+        renderThemeSettings(state.settings);
+        const picked = THEMES.find((t) => t.id === next);
+        if (picked) toast(`Style switched to ${picked.name} (${picked.mode})`, 'ok', { key: 'theme' });
+      })
+    );
+  }
+
+  function renderApiKeysSettings(settings) {
+    const box = $('#apiKeysBox');
+    if (!box) return;
+    const ak = (settings && settings.apiKeys) || {};
+    box.hidden = false;
+    box.innerHTML = `
+      <div class="api-keys-head">
+        <span class="lan-label">Catalog Data Providers</span>
+        <span class="api-key-badge ok">Cloud Managed</span>
+      </div>
+      <div class="api-key-hint">TVmaze schedule cache is active globally${ak.tmdb ? ' · TMDB movie discovery connected' : ' · TMDB movies optional'}. All personal favorites, hidden titles, Word Pool rules &amp; themes stay private in your browser.</div>`;
+  }
+
+  const DISC_GENRES = ['Drama', 'Comedy', 'Crime', 'Thriller', 'Mystery', 'Action', 'Science-Fiction', 'Fantasy', 'Horror', 'Documentary', 'Animation', 'Romance'];
+  let discRulesOpen = false;
+  let interestsOpen = false;
+
+  function renderInterestsSettings() {
+    const box = $('#interestsBox');
+    if (!box) return;
+    box.hidden = false;
+    const selected = new Set((state.settings && state.settings.interests) || []);
+    const pool = new Set([...DISC_GENRES, 'Adventure', 'Family', 'Western', 'Music', ...selected]);
+    for (const col of [state.shows, state.movies]) {
+      for (const s of col.values()) for (const g of s.genres || []) pool.add(g);
+    }
+    const genres = [...pool].sort((a, b) => a.localeCompare(b));
+    const selList = [...selected].sort((a, b) => a.localeCompare(b));
+    const summary = selList.length ? selList.join(', ') : 'None selected';
+    box.innerHTML = `
+      <div class="int-head">
+        <div class="int-title"><span class="int-dot"></span><span>My interests</span>${selList.length ? `<span class="int-count">${selList.length}</span>` : ''}</div>
+        ${selList.length ? '<button type="button" class="mini-text-btn muted-btn" id="clearInterestsBtn">Clear</button>' : ''}
+      </div>
+      <div class="int-sub">Highlights matching shows &amp; movies; bounces on premieres</div>
+      <details class="disc-rules int-details"${interestsOpen || selList.length ? ' open' : ''}>
+        <summary>${esc(summary)}</summary>
+        <div class="genre-chips" style="margin-top:8px">
+          ${genres.map((g) => `<button type="button" class="ichip${selected.has(g) ? ' on' : ''}" data-int="${esc(g)}">${esc(g)}</button>`).join('')}
+        </div>
+      </details>`;
+    $('.int-details', box).addEventListener('toggle', (e) => {
+      interestsOpen = e.currentTarget.open;
+    });
+    const saveInterests = (nextList) => {
+      const clean = [...new Set((nextList || []).map((x) => String(x || '').trim()).filter(Boolean))].slice(0, 30);
+      state.settings = { ...state.settings, interests: clean };
+      store.setJson('interests', clean);
+      renderInterestsSettings();
+      renderCalendar();
+    };
+    $$('[data-int]', box).forEach((b) =>
+      b.addEventListener('click', () => {
+        const g = b.dataset.int;
+        const next = new Set(selected);
+        if (next.has(g)) next.delete(g);
+        else next.add(g);
+        saveInterests([...next]);
+      })
+    );
+    const clr = $('#clearInterestsBtn', box);
+    if (clr) clr.addEventListener('click', () => saveInterests([]));
+  }
+
+  const SYNC_LANGUAGES = ['English', 'Spanish', 'French', 'German', 'Japanese', 'Korean', 'Swedish', 'Norwegian', 'Danish', 'Finnish', 'Dutch', 'Italian', 'Portuguese', 'Polish'];
+  const SYNC_EXCLUDED_TYPES = ['Talk Show', 'News', 'Sports', 'Game Show', 'Reality', 'Variety'];
+
+  function renderHiddenSettings(settings) {
+    const box = $('#hiddenSettingsBox');
+    if (!box) return;
+    const showHidden = Boolean(settings && settings.showHidden);
+    const hideWatched = Boolean(state.hideWatched);
+    const hiddenTotal = state.hiddenItems.length;
+    box.hidden = false;
+    box.innerHTML = `
+      <div class="disc-row">
+        <label class="disc-title" for="showHiddenToggle">
+          <span>Show hidden items (25% opacity)</span>
+        </label>
+        <label class="switch" title="Show hidden shows &amp; movies inline on your calendar at 25% opacity">
+          <input id="showHiddenToggle" type="checkbox"${showHidden ? ' checked' : ''} />
+          <span class="switch-track"></span>
+        </label>
+      </div>
+      <div class="disc-row" style="margin-top:8px">
+        <label class="disc-title" for="hideWatchedToggle">
+          <span>Hide watched / grabbed items</span>
+        </label>
+        <label class="switch" title="Filter out checked episodes &amp; movies from calendar views">
+          <input id="hideWatchedToggle" type="checkbox"${hideWatched ? ' checked' : ''} />
+          <span class="switch-track"></span>
+        </label>
+      </div>
+      <div class="disc-sub">
+        <span>${hiddenTotal} hidden item${hiddenTotal === 1 ? '' : 's'} stay concealed in your personal browser calendar.</span>
+        <button type="button" class="mini-text-btn muted-btn" id="openHiddenTabBtn">Manage</button>
+      </div>`;
+    $('#openHiddenTabBtn', box).addEventListener('click', () => setDrawerTab('hidden'));
+    $('#showHiddenToggle', box).addEventListener('change', async (e) => {
+      const nextVal = Boolean(e.target.checked);
+      state.settings = { ...state.settings, showHidden: nextVal };
+      store.set('showHidden', nextVal ? '1' : '0');
+      renderHiddenSettings(state.settings);
+      await reloadAll();
+      toast(nextVal ? 'Hidden items shown at 25% opacity' : 'Hidden items concealed from calendar', 'ok');
+    });
+    $('#hideWatchedToggle', box).addEventListener('change', (e) => {
+      toggleHideWatched(Boolean(e.target.checked));
+    });
+  }
+
+  function renderDiscovery(disc) {
+    const box = $('#discoveryBox');
+    if (!box) return;
+    box.hidden = false;
+    box.innerHTML = `
+      <div class="disc-row">
+        <span class="disc-title"><span>Shared Cloud Catalog Sync</span></span>
+        <span class="api-key-badge ok">Automatic</span>
+      </div>
+      <div class="disc-sub">
+        <span>Updated hourly via Cloudflare Cron (${(disc && disc.lastRun) ? `last sync ${new Date(disc.lastRun).toLocaleTimeString()}` : 'active'}). Use Search (+) to add any show or movie to your browser calendar.</span>
+      </div>`;
+  }
+
+  function renderDigestBanner(digest) {
+    const bar = $('#digestBanner');
+    if (!bar) return;
+    if (!digest || !digest.unreadCount || !digest.unreadItems || !digest.unreadItems.length) {
+      bar.hidden = true;
+      bar.innerHTML = '';
+      return;
+    }
+    const items = digest.unreadItems;
+    const showsAdded = items.filter((x) => x.kind === 'show' && x.event === 'added').length;
+    const moviesAdded = items.filter((x) => x.kind === 'movie' && x.event === 'added').length;
+    const updated = items.filter((x) => x.event === 'updated').length;
+    const parts = [
+      showsAdded ? `${showsAdded} new show${showsAdded === 1 ? '' : 's'}` : '',
+      moviesAdded ? `${moviesAdded} new movie${moviesAdded === 1 ? '' : 's'}` : '',
+      updated ? `${updated} schedule update${updated === 1 ? '' : 's'}` : '',
+    ].filter(Boolean);
+    bar.hidden = false;
+    bar.innerHTML = `
+      <div class="digest-banner-bar">
+        <div class="digest-banner-main">
+          <span class="digest-banner-dot" aria-hidden="true"></span>
+          <span><b>Since last visit:</b> ${esc(parts.join(' · ') || `${items.length} sync update(s)`)}</span>
+        </div>
+        <div class="digest-banner-actions">
+          <button type="button" class="mini-text-btn" id="digestToggleBtn">${state.digestExpanded ? 'Hide details' : 'Details'}</button>
+          <button type="button" class="mini-text-btn muted-btn" id="digestDismissBtn">Dismiss</button>
+        </div>
+      </div>
+      ${
+        state.digestExpanded
+          ? `<ul class="digest-banner-list">${items
+              .slice(0, 12)
+              .map(
+                (x) =>
+                  `<li><span><b>${esc(x.title)}</b>${x.detail ? ` — ${esc(x.detail)}` : ''}</span><span>${esc(relAgo(x.at))}</span></li>`
+              )
+              .join('')}</ul>`
+          : ''
+      }`;
+    $('#digestToggleBtn', bar).addEventListener('click', () => {
+      state.digestExpanded = !state.digestExpanded;
+      renderDigestBanner(digest);
+    });
+    $('#digestDismissBtn', bar).addEventListener('click', async () => {
+      const next = await api('/api/digest/read', { method: 'POST' }).catch(() => null);
+      state.digestExpanded = false;
+      if (state.status && next) state.status.digest = next;
+      renderDigestBanner(next || { unreadCount: 0, unreadItems: [] });
+      if ($('#drawer').classList.contains('open')) renderDigestBox(next);
+    });
+  }
+
+  function renderDigestBox(digest) {
+    const box = $('#digestBox');
+    if (!box) return;
+    box.hidden = false;
+    const list = (digest && digest.items) || [];
+    const unread = (digest && digest.unreadCount) || 0;
+    box.innerHTML = `
+      <div class="api-keys-head">
+        <span class="lan-label">Sync Activity Digest</span>
+        ${unread ? `<button type="button" class="mini-text-btn muted-btn" id="markDigestReadBtn">Mark ${unread} read</button>` : '<span class="api-key-badge muted">Up to date</span>'}
+      </div>
+      ${
+        list.length
+          ? `<ul class="digest-feed-list">${list
+              .slice(0, 15)
+              .map(
+                (x) =>
+                  `<li><div><div class="digest-feed-name">${esc(x.title)}</div><div class="digest-feed-meta">${esc(x.detail || x.event)}</div></div><span class="digest-feed-meta">${esc(relAgo(x.at))}</span></li>`
+              )
+              .join('')}</ul>`
+          : '<div class="muted" style="margin-top:6px;font-size:11.5px">New shows, TMDB movies, and TVmaze airdate changes appear here automatically.</div>'
+      }`;
+    $('#markDigestReadBtn', box)?.addEventListener('click', async () => {
+      const next = await api('/api/digest/read', { method: 'POST' });
+      if (state.status) state.status.digest = next;
+      renderDigestBanner(next);
+      renderDigestBox(next);
+    });
+  }
+
+  function maybeFireBrowserNotifications() {
+    if (!state.settings || !state.settings.notifyBrowser) return;
+    if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+    if (!state.showsLoaded || !state.loaded) return;
+    const today = ymd(new Date());
+    if (store.get('notifiedDate', '') === today) return;
+    const ints = interestSet();
+    const hits = [];
+    for (const ep of state.episodes) {
+      if (ep.watched || dayKeyOf(ep) !== today) continue;
+      const s = state.shows.get(ep.showId);
+      if (!s || s.hidden) continue;
+      const isPrem = ep.premiere === 'series' || ep.premiere === 'season';
+      const hitInt = (s.genres || []).some((g) => ints.has(g));
+      if (s.favorite || (hitInt && (isPrem || ep.isNew))) {
+        hits.push(`${s.name} (${epCode(ep)})`);
+      }
+    }
+    for (const me of state.movieEvents) {
+      if (me.watched || me.airdate !== today) continue;
+      const m = state.movies.get(me.movieId);
+      if (!m || m.hidden) continue;
+      const hitInt = (m.genres || []).some((g) => ints.has(g));
+      if (m.favorite || hitInt) hits.push(m.name);
+    }
+    if (!hits.length) return;
+    store.set('notifiedDate', today);
+    try {
+      new Notification(`Viuhti · ${hits.length} release${hits.length === 1 ? '' : 's'} today`, {
+        body: hits.slice(0, 4).join(' · '),
+        tag: `viuhti-${today}`,
+      });
+    } catch {
+      /* ignore browser Notification constructor error */
+    }
+  }
+
+  function renderAlertsSettings(settings) {
+    const box = $('#alertsBox');
+    if (!box) return;
+    box.hidden = false;
+    const notifyBrowser = Boolean(settings && settings.notifyBrowser);
+    box.innerHTML = `
+      <div class="api-keys-head">
+        <span class="lan-label">Premiere Alerts</span>
+        <span class="api-key-badge ${notifyBrowser ? 'ok' : 'muted'}">${notifyBrowser ? 'Active' : 'Off'}</span>
+      </div>
+      <div class="disc-row" style="margin-top:8px">
+        <label class="disc-title" for="notifyBrowserToggle">
+          <span>Browser notifications (today's Favorites &amp; premieres)</span>
+        </label>
+        <label class="switch">
+          <input id="notifyBrowserToggle" type="checkbox"${notifyBrowser ? ' checked' : ''} />
+          <span class="switch-track"></span>
+        </label>
+      </div>
+      <div class="ext-url-doc">Notifications run locally in your browser when a starred or matched interest premiere airs today.</div>`;
+    $('#notifyBrowserToggle', box).addEventListener('change', async (e) => {
+      let enabled = Boolean(e.target.checked);
+      if (enabled && typeof Notification !== 'undefined' && Notification.permission === 'default') {
+        const perm = await Notification.requestPermission().catch(() => 'denied');
+        if (perm === 'denied') {
+          enabled = false;
+          e.target.checked = false;
+          toast('Browser notification permission denied', 'err');
+          return;
+        }
+      }
+      state.settings = { ...state.settings, notifyBrowser: enabled };
+      store.set('notifyBrowser', enabled ? '1' : '0');
+      renderAlertsSettings(state.settings);
+      if (enabled) maybeFireBrowserNotifications();
+      toast(enabled ? 'Browser premiere alerts enabled' : 'Browser alerts paused', 'ok');
+    });
+  }
+
+  function renderBackupSettings() {
+    const box = $('#backupBox');
+    if (!box) return;
+    box.hidden = false;
+    const icsUrl = `${location.origin}/api/calendar.ics`;
+    box.innerHTML = `
+      <div class="api-keys-head">
+        <span class="lan-label">Calendar Feed (.ics) &amp; Backup</span>
+        <span class="muted" style="font-size:11px">Client-Side Customizations</span>
+      </div>
+      <div class="ext-url-doc" style="margin:6px 0 8px">Shared catalog cache runs on Cloudflare D1; your favorites, hidden list, watched history, Word Pool rules, themes &amp; filters live privately in your browser.</div>
+      <div class="ext-url-preview" title="${esc(icsUrl)}">Public iCal feed: <code>${esc(icsUrl)}</code></div>
+      <div class="settings-btn-row">
+        <button id="copyIcsBtn" class="btn btn-small btn-ghost" type="button">Copy .ics URL</button>
+        <button id="downloadPersonalIcsBtn" class="btn btn-small btn-ghost" type="button">Download My .ics</button>
+      </div>
+      <div class="settings-btn-row" style="margin-top:8px">
+        <button id="exportBackupBtn" class="btn btn-small btn-ghost" type="button">Export My Backup</button>
+        <button id="importBackupBtn" class="btn btn-small btn-ghost" type="button">Restore Backup…</button>
+        <button id="resetLocalPrefsBtn" class="btn btn-small btn-ghost" type="button">Reset Local Data</button>
+        <input id="importBackupFile" type="file" accept="application/json,.json" hidden />
+      </div>`;
+    $('#resetLocalPrefsBtn', box)?.addEventListener('click', async () => {
+      for (const k of Object.keys(localStorage)) {
+        if (k.startsWith('viuhti.')) localStorage.removeItem(k);
+      }
+      applyTheme('midnight');
+      state.settings = { ...state.settings, style: 'midnight', interests: [], showHidden: false, hideWatched: false, notifyBrowser: false, extSearchUrl: '' };
+      state.media = 'shows';
+      state.filter = 'all';
+      state.timeMode = 'local';
+      state.density = 'cards';
+      state.hideWatched = false;
+      state.favoritesOnly = false;
+      state.genre = '';
+      state.channel = '';
+      state.discover = { ...state.discover, media: 'all', lens: 'mix', anchor: '', studioOpen: false, tunerOpen: false, data: null };
+      rawDiscoverData = null;
+      $$('#mediaSeg button').forEach((b) => b.classList.toggle('on', b.dataset.value === state.media));
+      $$('#filterSeg button').forEach((b) => b.classList.toggle('on', b.dataset.value === state.filter));
+      $$('#timeSeg button').forEach((b) => b.classList.toggle('on', b.dataset.value === state.timeMode));
+      $$('#densitySeg button').forEach((b) => b.classList.toggle('on', b.dataset.value === state.density));
+      await reloadAll();
+      if (state.tab === 'discover') await loadDiscover(false);
+      renderThemeSettings(state.settings);
+      renderInterestsSettings();
+      renderHiddenSettings(state.settings);
+      renderAlertsSettings(state.settings);
+      renderExtSettings(state.settings);
+      renderWordPoolSettings();
+      toast('All local browser customizations reset to defaults', 'ok');
+    });
+    $('#copyIcsBtn', box).addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(icsUrl);
+        toast('Copied .ics calendar URL', 'ok');
+      } catch {
+        toast(icsUrl, 'ok');
+      }
+    });
+    $('#downloadPersonalIcsBtn', box).addEventListener('click', () => {
+      const ics = window.ViuhtiClient.buildPersonalIcs(state.episodes, state.movieEvents, state.shows, state.movies);
+      const blob = new Blob([ics], { type: 'text/calendar;charset=utf-8' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `viuhti-${ymd(new Date())}.ics`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1500);
+    });
+    $('#exportBackupBtn', box).addEventListener('click', () => {
+      const payload = window.ViuhtiClient.buildPersonalBackup(state.settings);
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `viuhti-backup-${ymd(new Date())}.json`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1500);
+      toast('Exported browser backup JSON', 'ok');
+    });
+    const fileInp = $('#importBackupFile', box);
+    $('#importBackupBtn', box).addEventListener('click', () => fileInp.click());
+    fileInp.addEventListener('change', async () => {
+      const file = fileInp.files && fileInp.files[0];
+      if (!file) return;
+      try {
+        const text = await file.text();
+        const data = JSON.parse(text);
+        if (!data || data.origin !== 'viuhti') throw new Error('Invalid Viuhti backup file');
+        const res = window.ViuhtiClient.importPersonalBackup(data);
+        if (data.settings && typeof data.settings === 'object') {
+          const s = data.settings;
+          if (s.style) state.settings.style = applyTheme(s.style);
+          if (Array.isArray(s.interests)) {
+            state.settings.interests = s.interests;
+            store.setJson('interests', s.interests);
+          }
+          if (s.showHidden !== undefined) {
+            state.settings.showHidden = Boolean(s.showHidden);
+            store.set('showHidden', state.settings.showHidden ? '1' : '0');
+          }
+          if (s.hideWatched !== undefined) {
+            state.hideWatched = Boolean(s.hideWatched);
+            state.settings.hideWatched = state.hideWatched;
+            store.set('hideWatched', state.hideWatched ? '1' : '0');
+          }
+          if (s.notifyBrowser !== undefined) {
+            state.settings.notifyBrowser = Boolean(s.notifyBrowser);
+            store.set('notifyBrowser', state.settings.notifyBrowser ? '1' : '0');
+          }
+          if (typeof s.extSearchUrl === 'string') {
+            state.settings.extSearchUrl = s.extSearchUrl;
+            store.set('extSearchUrl', s.extSearchUrl);
+          }
+        }
+        await reloadAll();
+        toast(`Restored ${res.showIdsToHydrate.length} shows & ${res.movieIdsToHydrate.length} movies into your browser`, 'ok');
+      } catch (err) {
+        toast(err.message || 'Could not import backup', 'err');
+      } finally {
+        fileInp.value = '';
+      }
+    });
+  }
+
+  function renderExtSettings(settings) {
+    const box = $('#extSettingsBox');
+    if (!box) return;
+    const curUrl = (settings && settings.extSearchUrl) || '';
+    box.hidden = false;
+    const sampleUrl = extSearchUrl('The Last of Us', { season: 2, number: 1 });
+    box.innerHTML = `
+      <div class="api-keys-head">
+        <span class="lan-label">External Search</span>
+        <span class="api-key-badge ${curUrl ? 'ok' : 'muted'}">${curUrl ? 'Configured' : 'Not set'}</span>
+      </div>
+      <div class="api-key-field">
+        <div class="api-key-row">
+          <input id="extUrlInput" type="url" autocomplete="off" spellcheck="false" value="${esc(curUrl)}" placeholder="https://example.com/search?q={query}%201080p" aria-label="External Search URL template" />
+          <button id="extUrlSave" class="btn btn-small btn-ghost" type="button">Save</button>
+          ${curUrl ? '<button id="extUrlClear" class="btn btn-small btn-ghost" type="button">Clear</button>' : ''}
+        </div>
+        <div class="ext-url-doc">
+          <b>What <code>{query}</code> does:</b> Viuhti replaces <code>{query}</code> with the URL-encoded search text for that card:<br>
+          • <b>Single TV episode:</b> <code>Show Name S01E02</code><br>
+          • <b>Multi-episode / pack:</b> <code>Show Name S01</code><br>
+          • <b>Movie:</b> <code>Movie Title 2026</code><br>
+          Include any resolution, tags, or sort params directly in your URL (e.g. <code>https://site.com/search?q={query}%201080p</code>). If you omit <code>{query}</code>, the encoded query is appended to the end.
+        </div>
+        ${sampleUrl ? `<div class="ext-url-preview" title="${esc(sampleUrl)}">Preview: ${esc(sampleUrl)}</div>` : ''}
+      </div>`;
+
+    const applyUrl = (val) => {
+      const clean = String(val || '').trim().slice(0, 300);
+      if (clean && !/^https?:\/\/.+/i.test(clean)) {
+        toast('External search URL must start with http:// or https://', 'err');
+        return;
+      }
+      state.settings = { ...state.settings, extSearchUrl: clean };
+      store.set('extSearchUrl', clean);
+      renderExtSettings(state.settings);
+      renderCalendar();
+      toast(clean ? 'External Search URL saved locally' : 'External Search URL cleared', 'ok');
+    };
+    $('#extUrlSave', box).addEventListener('click', () => applyUrl($('#extUrlInput', box).value.trim()));
+    $('#extUrlInput', box).addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') applyUrl(e.target.value.trim());
+    });
+    $('#extUrlClear', box)?.addEventListener('click', () => applyUrl(''));
+  }
+
+  // ---------- Toasts ----------
+  function toast(msg, type = 'ok', action = null) {
+    if (action && action.key) {
+      $$('#toasts .toast').forEach((t) => {
+        if (t.dataset.tkey === action.key) t.remove();
+      });
+    }
+    const el = document.createElement('div');
+    el.className = `toast ${type}`;
+    if (action && action.key) el.dataset.tkey = action.key;
+    el.innerHTML = `${type === 'err' ? ICON.alert : ICON.check}<span>${esc(msg)}</span>`;
+    if (action && action.label) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'toast-action';
+      btn.textContent = action.label;
+      btn.addEventListener('click', () => {
+        el.remove();
+        if (action.onClick) action.onClick();
+      });
+      el.appendChild(btn);
+    }
+    $('#toasts').appendChild(el);
+    setTimeout(() => {
+      if (!el.isConnected) return;
+      el.style.transition = 'opacity .3s, transform .3s';
+      el.style.opacity = '0';
+      el.style.transform = 'translateY(6px)';
+      setTimeout(() => el.remove(), 300);
+    }, action && action.label ? 5500 : 3200);
+  }
+
+  // ---------- Segmented controls ----------
+  function bindSeg(id, key, onChange) {
+    const seg = $(id);
+    const sync = () => $$('button', seg).forEach((b) => b.classList.toggle('on', b.dataset.value === state[key]));
+    sync();
+    seg.addEventListener('click', (e) => {
+      const b = e.target.closest('button');
+      if (!b) return;
+      state[key] = b.dataset.value;
+      store.set(key, state[key]);
+      sync();
+      onChange();
+    });
+  }
+  bindSeg('#mediaSeg', 'media', () => {
+    updateFavUi();
+    populateGenres();
+    populateChannels();
+    renderCalendar(true);
+  });
+  bindSeg('#filterSeg', 'filter', renderCalendar);
+  bindSeg('#timeSeg', 'timeMode', renderCalendar);
+  {
+    const seg = $('#densitySeg');
+    const sync = () => $$('button', seg).forEach((b) => b.classList.toggle('on', b.dataset.value === state.density));
+    sync();
+    seg.addEventListener('click', (e) => {
+      const b = e.target.closest('button');
+      if (!b || b.dataset.value === state.density) return;
+      const prev = state.density;
+      state.density = b.dataset.value;
+      store.set('density', state.density);
+      sync();
+      if (state.density === 'day' || state.density === 'month' || state.density === 'agenda' || prev === 'day' || prev === 'month' || prev === 'agenda') {
+        loadWeek().catch((err) => toast(err.message, 'err'));
+      } else {
+        renderCalendar();
+      }
+    });
+  }
+
+  function openDayView(dateStr) {
+    state.focusDate = dateStr;
+    state.weekStart = startOfWeek(new Date(dateStr + 'T12:00:00'));
+    state.density = 'day';
+    store.set('density', 'day');
+    $$('#densitySeg button').forEach((b) => b.classList.toggle('on', b.dataset.value === 'day'));
+    loadWeek().catch((e) => toast(e.message, 'err'));
+  }
+
+  function setGenre(g) {
+    state.genre = g || '';
+    store.set('genre', state.genre);
+    $('#genreFilter').value = state.genre;
+    $('#genreWrap').classList.toggle('active', Boolean(state.genre));
+    renderCalendar();
+  }
+  $('#genreFilter').addEventListener('change', (e) => setGenre(e.target.value));
+
+  function toggleFavFilter() {
+    state.favoritesOnly = !state.favoritesOnly;
+    store.set('favOnly', state.favoritesOnly ? '1' : '0');
+    updateFavUi();
+    renderCalendar();
+  }
+  $('#favFilterBtn').addEventListener('click', toggleFavFilter);
+
+  function setChannel(c) {
+    state.channel = c || '';
+    store.set('channel', state.channel);
+    if ($('#channelFilter')) $('#channelFilter').value = state.channel;
+    $('#channelWrap')?.classList.toggle('active', Boolean(state.channel));
+    renderCalendar();
+  }
+  $('#channelFilter')?.addEventListener('change', (e) => setChannel(e.target.value));
+
+  function toggleHideWatched(explicit = undefined) {
+    const next = explicit !== undefined ? Boolean(explicit) : !state.hideWatched;
+    state.hideWatched = next;
+    state.settings = { ...state.settings, hideWatched: next };
+    store.set('hideWatched', next ? '1' : '0');
+    updateWatchedFilterUi();
+    if ($('#hideWatchedToggle')) $('#hideWatchedToggle').checked = next;
+    renderCalendar();
+  }
+  $('#watchedFilterBtn')?.addEventListener('click', () => toggleHideWatched());
+
+  // ---------- Period navigation & Month picker ----------
+  function shiftWeek(n) {
+    const todayStr = ymd(new Date());
+    if (n === 0) {
+      const now = new Date();
+      state.focusDate = ymd(now);
+      state.weekStart = startOfWeek(now);
+    } else if (state.density === 'day') {
+      const d = addDays(new Date(state.focusDate + 'T12:00:00'), n);
+      state.focusDate = ymd(d);
+      state.weekStart = startOfWeek(d);
+    } else if (state.density === 'month') {
+      const cur = new Date(state.focusDate + 'T12:00:00');
+      const d = new Date(cur.getFullYear(), cur.getMonth() + n, 1);
+      state.focusDate = ymd(d).slice(0, 7) === todayStr.slice(0, 7) ? todayStr : ymd(d);
+      state.weekStart = startOfWeek(new Date(state.focusDate + 'T12:00:00'));
+    } else {
+      state.weekStart = addDays(state.weekStart, 7 * n);
+      const endStr = ymd(addDays(state.weekStart, 6));
+      state.focusDate = todayStr >= ymd(state.weekStart) && todayStr <= endStr ? todayStr : ymd(state.weekStart);
+    }
+    loadWeek().catch((e) => toast(e.message, 'err'));
+  }
+  $('#prevWeek').addEventListener('click', () => shiftWeek(-1));
+  $('#nextWeek').addEventListener('click', () => shiftWeek(1));
+  $('#todayBtn').addEventListener('click', () => shiftWeek(0));
+
+  let mpMonth = new Date(state.weekStart.getFullYear(), state.weekStart.getMonth(), 1);
+  async function renderMonthPicker() {
+    const mp = $('#monthPicker');
+    const year = mpMonth.getFullYear();
+    const month = mpMonth.getMonth();
+    const first = new Date(year, month, 1);
+    const gridStart = startOfWeek(first);
+    const gridEnd = addDays(gridStart, 41);
+    const today = ymd(new Date());
+    const selStart = ymd(state.weekStart);
+    const selEnd = ymd(addDays(state.weekStart, 6));
+
+    let activeDates = new Set();
+    try {
+      const data = await api(`/api/schedule?from=${ymd(gridStart)}&to=${ymd(gridEnd)}`);
+      if (state.media !== 'movies') {
+        for (const e of data.episodes || []) if (e.airdate) activeDates.add(e.airdate);
+      }
+      if (state.media !== 'shows') {
+        for (const m of data.movies || []) if (m.airdate) activeDates.add(m.airdate);
+      }
+    } catch { /* ignore */ }
+
+    const cells = [];
+    for (let i = 0; i < 42; i++) {
+      const d = addDays(gridStart, i);
+      const k = ymd(d);
+      const cls = [
+        'mp-day',
+        d.getMonth() !== month ? 'out' : '',
+        k >= selStart && k <= selEnd ? 'in-week' : '',
+        k === today ? 'today' : '',
+        activeDates.has(k) ? 'has-ep' : '',
+      ]
+        .filter(Boolean)
+        .join(' ');
+      cells.push(`<button type="button" class="${cls}" data-jump="${k}">${d.getDate()}</button>`);
+    }
+    mp.innerHTML = `
+      <div class="mp-head">
+        <button type="button" class="icon-btn" id="mpPrev" aria-label="Previous month"><svg viewBox="0 0 24 24"><path d="m15 5-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        <span>${esc(fmtDay(first, { month: 'long', year: 'numeric' }))}</span>
+        <button type="button" class="icon-btn" id="mpNext" aria-label="Next month"><svg viewBox="0 0 24 24"><path d="m9 5 7 7-7 7" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+      </div>
+      <div class="mp-grid">
+        ${['M', 'T', 'W', 'T', 'F', 'S', 'S'].map((w) => `<div class="mp-dow">${w}</div>`).join('')}
+        ${cells.join('')}
+      </div>`;
+    $('#mpPrev', mp).addEventListener('click', () => {
+      mpMonth = new Date(year, month - 1, 1);
+      renderMonthPicker();
+    });
+    $('#mpNext', mp).addEventListener('click', () => {
+      mpMonth = new Date(year, month + 1, 1);
+      renderMonthPicker();
+    });
+    $$('[data-jump]', mp).forEach((b) =>
+      b.addEventListener('click', () => {
+        state.focusDate = b.dataset.jump;
+        state.weekStart = startOfWeek(new Date(b.dataset.jump + 'T12:00:00'));
+        mp.hidden = true;
+        $('#weekPickerBtn').setAttribute('aria-expanded', 'false');
+        loadWeek().catch((e) => toast(e.message, 'err'));
+      })
+    );
+  }
+  $('#weekPickerBtn').addEventListener('click', () => {
+    const mp = $('#monthPicker');
+    const open = mp.hidden;
+    mp.hidden = !open;
+    $('#weekPickerBtn').setAttribute('aria-expanded', String(open));
+    if (open) {
+      const ref = state.density === 'day' || state.density === 'month' ? new Date(state.focusDate + 'T12:00:00') : state.weekStart;
+      mpMonth = new Date(ref.getFullYear(), ref.getMonth(), 1);
+      renderMonthPicker();
+    }
+  });
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('#monthPicker') && !e.target.closest('#weekPickerBtn')) {
+      $('#monthPicker').hidden = true;
+      $('#weekPickerBtn').setAttribute('aria-expanded', 'false');
+    }
+    if (wizard.langOpen && !e.target.closest('.wiz-lang-drop')) {
+      const refilterFocus = e.target.id === 'wizFilterInput';
+      setWizLangOpen(false);
+      renderCalendar();
+      if (refilterFocus) $('#wizFilterInput')?.focus();
+    }
+  });
+
+  // ---------- Calendar interactions ----------
+  $('#calendar').addEventListener('click', (e) => {
+    const unhideBtn = e.target.closest('[data-unhide]');
+    if (unhideBtn) {
+      const key = unhideBtn.closest('[data-key]')?.dataset.key;
+      const g = key ? state.groups.get(key) : null;
+      const id = Number(unhideBtn.dataset.unhide);
+      const kind = unhideBtn.dataset.kind || 'show';
+      const item = (kind === 'movie' ? state.movies : state.shows).get(id);
+      const name = (g && g.show.name) || (item && item.name) || kind;
+      unhideItem(id, name, kind);
+      return;
+    }
+    const hideBtn = e.target.closest('[data-hide-card]');
+    if (hideBtn) {
+      const key = hideBtn.closest('[data-key]')?.dataset.key;
+      const g = key ? state.groups.get(key) : null;
+      const id = Number(hideBtn.dataset.hideCard);
+      const kind = hideBtn.dataset.kind || 'show';
+      const item = (kind === 'movie' ? state.movies : state.shows).get(id);
+      const name = (g && g.show.name) || (item && item.name) || kind;
+      hideItem(id, name, kind);
+      return;
+    }
+    const fav = e.target.closest('[data-fav]');
+    if (fav) {
+      toggleFavorite(Number(fav.dataset.fav), fav.dataset.kind || 'show');
+      return;
+    }
+    const jumpDay = e.target.closest('[data-jump-day]');
+    if (jumpDay) {
+      openDayView(jumpDay.dataset.jumpDay);
+      return;
+    }
+    const watchBtn = e.target.closest('[data-watch]');
+    if (watchBtn) {
+      const g = state.groups.get(watchBtn.dataset.watch);
+      if (g) {
+        const w = groupWatchInfo(g);
+        const entries = g.kind === 'movie'
+          ? [{ kind: 'movie', id: g.show.id }]
+          : g.eps.map((ep) => ({ kind: 'episode', id: ep.id }));
+        setWatchedItems(entries, !w.allDone);
+      }
+      return;
+    }
+    const epWatchBtn = e.target.closest('[data-ep-watch]');
+    if (epWatchBtn) {
+      const epId = Number(epWatchBtn.dataset.epWatch);
+      const epObj = state.episodes.find((ep) => ep.id === epId);
+      if (epObj) setWatchedItems([{ kind: 'episode', id: epId }], !epObj.watched);
+      return;
+    }
+    if (e.target.closest('[data-stop]')) return; // External Search link opens normally
+    const card = e.target.closest('.ep, .agenda-row, .day-card, .m-ev');
+    if (card) openModal(card.dataset.key);
+  });
+  $('#calendar').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && e.target.matches('.ep, .agenda-row, .day-card, .m-ev')) openModal(e.target.dataset.key);
+  });
+  $('#modal').addEventListener('click', (e) => {
+    if (e.target.closest('[data-close]')) closeModal();
+  });
+
+  // ---------- Keyboard shortcuts ----------
+  document.addEventListener('keydown', (e) => {
+    const typing = /INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName);
+    if (e.key === 'Escape') {
+      if (!$('#modal').hidden) closeModal();
+      else if (wizard.langOpen) {
+        setWizLangOpen(false);
+        renderCalendar();
+        $('#wizLangBtn')?.focus();
+      } else if (!$('#monthPicker').hidden) {
+        $('#monthPicker').hidden = true;
+        $('#weekPickerBtn').setAttribute('aria-expanded', 'false');
+      } else if ($('#drawer').classList.contains('open')) closeDrawer();
+      return;
+    }
+    if (typing || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key === '/') {
+      e.preventDefault();
+      searchInput.focus();
+      searchInput.select();
+    } else if (!$('#modal').hidden) {
+      return;
+    } else if (e.key === '1') switchTab('calendar');
+    else if (e.key === '2') switchTab('discover');
+    else if (e.key === '3' || e.key.toLowerCase() === 'g') switchTab(state.tab === 'graxobolt' && e.key !== '3' ? 'calendar' : 'graxobolt');
+    else if (e.key.toLowerCase() === 'm') ($('#drawer').classList.contains('open') ? closeDrawer : openDrawer)();
+    else if (state.tab !== 'graxobolt' && e.key.toLowerCase() === 'd') switchTab(state.tab === 'discover' ? 'calendar' : 'discover');
+    else if (state.tab !== 'calendar') return;
+    else if (e.key === 'ArrowLeft') shiftWeek(-1);
+    else if (e.key === 'ArrowRight') shiftWeek(1);
+    else if (e.key.toLowerCase() === 't') shiftWeek(0);
+    else if (e.key.toLowerCase() === 'f') toggleFavFilter();
+    else if (e.key.toLowerCase() === 'w') toggleHideWatched();
+  });
+
+  // ---------- Discover Deep-Dive & Graxobolt Tabs ----------
+  function syncMainTabUi() {
+    const isCal = state.tab === 'calendar';
+    const isDisc = state.tab === 'discover';
+    const isGb = state.tab === 'graxobolt';
+    $$('#mainTabs button[data-tab]').forEach((b) => {
+      const active = b.dataset.tab === state.tab;
+      b.classList.toggle('on', active);
+      b.setAttribute('aria-selected', String(active));
+    });
+    const wb = $('.weekbar');
+    if (wb) wb.hidden = !isCal;
+    const cal = $('#calendar');
+    if (cal) cal.hidden = !isCal;
+    const db = $('#digestBanner');
+    if (db) {
+      if (!isCal) db.hidden = true;
+      else renderDigestBanner(state.status && state.status.digest);
+    }
+    const dv = $('#discoverView');
+    if (dv) dv.hidden = !isDisc;
+    const gv = $('#graxoboltView');
+    if (gv) gv.hidden = !isGb;
+    document.body.classList.toggle('gb-active', isGb);
+  }
+
+  async function openGraxobolt(seedOpt = null) {
+    if (state.tab !== 'graxobolt') {
+      state.tab = 'graxobolt';
+      store.set('tab', state.tab);
+      syncMainTabUi();
+    }
+    const gv = $('#graxoboltView');
+    if (!gv) return;
+    if (!gbController) {
+      gv.innerHTML = '<div class="gb-loading"><span class="spinner" aria-hidden="true"></span><span>Igniting Graxobolt engine…</span></div>';
+      try {
+        const mod = await import('/graxobolt.mjs');
+        gbController = mod.mountGraxobolt(gv, {
+          api,
+          toast,
+          onFeedback: async (payload) => sendDiscoverFeedback(payload),
+          onOpenModal: (item) => openDiscoverModal(item),
+        });
+      } catch (err) {
+        gv.innerHTML = `<div class="empty-state"><h2>Could not initialize Graxobolt</h2><p class="muted">${esc(err.message)}</p></div>`;
+        return;
+      }
+    } else {
+      gbController.resume();
+      gbController.refreshTheme();
+    }
+    if (!gbController.isReady()) return;
+    if (seedOpt) gbController.loadSeed(seedOpt);
+    else gbController.loadTaste();
+  }
+
+  function switchTab(nextTab) {
+    const valid = nextTab === 'discover' ? 'discover' : nextTab === 'graxobolt' ? 'graxobolt' : 'calendar';
+    if (state.tab === 'graxobolt' && valid !== 'graxobolt' && gbController) {
+      gbController.pause();
+    }
+    state.tab = valid;
+    store.set('tab', state.tab);
+    syncMainTabUi();
+    if (state.tab === 'discover') {
+      loadDiscover();
+    } else if (state.tab === 'graxobolt') {
+      openGraxobolt();
+    } else if (state.showsLoaded) {
+      loadWeek(false).catch(() => {});
+    }
+  }
+
+  $('#mainTabs')?.addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-tab]');
+    if (!btn || btn.dataset.tab === state.tab) return;
+    switchTab(btn.dataset.tab);
+  });
+
+  async function loadDiscover(autoScan = true) {
+    const view = $('#discoverView');
+    if (!view) return;
+    state.discover.loading = true;
+    if (!state.discover.data) {
+      view.innerHTML = '<div class="empty-state" style="padding:36px"><span class="spinner" style="display:inline-block;margin-right:8px;vertical-align:-2px"></span>Loading your Taste DNA…</div>';
+    }
+    try {
+      const qs = new URLSearchParams({
+        media: state.discover.media,
+        lens: state.discover.lens,
+        anchor: state.discover.anchor,
+        seeds: '1',
+      });
+      const raw = await api(`/api/discover?${qs}`);
+      rawDiscoverData = raw;
+      const data = window.ViuhtiClient.applyToDiscover(raw, state.shows, state.movies, state.discover.media, state.discover.lens);
+      state.discover.data = data;
+      state.discover.loading = false;
+      renderDiscoverView();
+    } catch (err) {
+      state.discover.loading = false;
+      if (state.discover.data) {
+        renderDiscoverView();
+        toast(err.message || 'Filter temporarily unavailable — see /status', 'err');
+      } else {
+        view.innerHTML = `<div class="empty-state"><h2>Could not load Discover</h2><p class="muted">${esc(err.message)}</p></div>`;
+      }
+    }
+  }
+
+  async function runDiscoverScan(manual = true) {
+    if (manual) toast('Refreshing recommendations…', 'ok');
+    await loadDiscover(false);
+  }
+
+  async function sendDiscoverFeedback(payload) {
+    const kind = payload.kind === 'movie' ? 'movie' : 'show';
+    const item = payload.item || {};
+    const id = Number(kind === 'movie' ? payload.tmdbId || payload.id : payload.tvmazeId || payload.id);
+    if (payload.action === 'track') {
+      await addItem(id, item.name || `${kind} #${id}`, kind);
+      await loadDiscover(false);
+      return true;
+    }
+    const taste = window.ViuhtiClient.getTaste();
+    if (payload.action === 'clear') {
+      delete taste.feedback[kind][String(id)];
+    } else {
+      taste.feedback[kind][String(id)] = {
+        action: payload.action,
+        name: item.name || `${kind} #${id}`,
+        genres: item.genres || [],
+        at: Date.now(),
+      };
+      if (payload.action === 'dislike' && id) {
+        await hideItem(id, item.name || `${kind} #${id}`, kind);
+      }
+    }
+    window.ViuhtiClient.saveTaste(taste);
+    if (state.discover.data) {
+      state.discover.data = window.ViuhtiClient.applyToDiscover(rawDiscoverData || state.discover.data, state.shows, state.movies, state.discover.media, state.discover.lens);
+      renderDiscoverView();
+    }
+    toast(
+      payload.action === 'liked'
+        ? `Saved "${item.name || 'title'}" to your Taste DNA`
+        : payload.action === 'seen'
+        ? 'Marked as already seen'
+        : `Hid "${item.name || 'title'}"`,
+      'ok'
+    );
+    return true;
+  }
+
+  async function toggleDiscoverTrait(kind, key) {
+    const taste = window.ViuhtiClient.getTaste();
+    const arr = new Set(kind === 'boost' ? taste.overrides.boost : taste.overrides.mute);
+    if (arr.has(key)) arr.delete(key);
+    else arr.add(key);
+    if (kind === 'boost') taste.overrides.boost = [...arr];
+    else taste.overrides.mute = [...arr];
+    window.ViuhtiClient.saveTaste(taste);
+    if (state.discover.data) {
+      state.discover.data = window.ViuhtiClient.applyToDiscover(rawDiscoverData || state.discover.data, state.shows, state.movies, state.discover.media, state.discover.lens);
+      renderDiscoverView();
+    }
+    return true;
+  }
+
+  function renderDiscoverView() {
+    const view = $('#discoverView');
+    const data = state.discover.data;
+    if (!view || !data) return;
+
+    const prof = data.profile || {};
+    const jobRunning = Boolean((data.job && data.job.running) || state.discover.wasRunning);
+    const items = data.items || [];
+    const seeds = data.starterSeeds || [];
+    const anchors = prof.anchors || [];
+    const showSeeds = seeds.length > 0 && (prof.coldStart || state.discover.tunerOpen);
+
+    const mediaButtons = [
+      ['all', 'All'],
+      ['show', 'TV Shows'],
+      ['movie', 'Movies'],
+    ];
+    const lensButtons = [
+      ['mix', 'Deep Mix'],
+      ['gems', 'Hidden Gems'],
+      ['upcoming', 'Airing Soon'],
+      ['binge', 'Bingeable'],
+    ];
+
+    view.innerHTML = `
+      <div class="disc-hero">
+        <div class="disc-hero-main">
+          <div class="disc-hero-head">
+            <h1 class="disc-hero-title">Deep Dive Recommendations</h1>
+            <span class="disc-mode-badge${prof.tmdbEnabled ? '' : ' basic'}">
+              ${prof.tmdbEnabled ? 'TVmaze + TMDB Deep DNA' : 'TVmaze + Keyless Movies + Wikipedia Lore'}
+            </span>
+          </div>
+          <p class="disc-sub" id="discPhaseText">
+            ${
+              jobRunning
+                ? esc((state.status && state.status.discover && state.status.discover.phase) || 'Mining themes, cast & recommendations…')
+                : `Trained locally on ${prof.positiveCount || 0} liked/active &amp; ${prof.negativeCount || 0} hidden/disliked titles${data.poolUpdatedAt ? ` · ${data.poolCount} analyzed` : ''}`
+            }
+          </p>
+          <div class="disc-conf-row" title="Taste engine confidence scales as you favorite, watch, rate, and hide titles">
+            <div class="disc-conf-bar"><div class="disc-conf-fill" style="width:${prof.confidence || 0}%"></div></div>
+            <span class="disc-conf-lbl">${prof.confidence || 0}% Taste Confidence</span>
+          </div>
+        </div>
+        <div class="disc-hero-right">
+          <button id="discWordPoolBtn" class="btn btn-small btn-ghost" type="button" title="Configure Primary* strict & Fuzzy Match word rules">
+            ⚡ Word Pool${state.wordpool.stats.active ? ` (${state.wordpool.stats.active})` : ''}
+          </button>
+          <button id="discStudioBtn" class="btn btn-small btn-ghost" type="button" aria-expanded="${state.discover.studioOpen}">
+            Taste Profile (${(prof.loves || []).length})
+          </button>
+          <button id="discTunerBtn" class="btn btn-small btn-ghost" type="button" aria-expanded="${state.discover.tunerOpen}">
+            Quick Rate
+          </button>
+          <button id="discRebuildBtn" class="btn btn-small" type="button" ${jobRunning ? 'disabled' : ''}>
+            ${jobRunning ? '<span class="spinner" aria-hidden="true"></span> Scanning…' : 'Analyze Deeper'}
+          </button>
+        </div>
+      </div>
+
+      <div class="disc-controls">
+        <div class="seg" id="discMediaSeg" role="group" aria-label="Discover media type">
+          ${mediaButtons.map(([val, lbl]) => `<button type="button" data-disc-media="${val}" class="${state.discover.media === val ? 'on' : ''}">${lbl}</button>`).join('')}
+        </div>
+        <div class="seg" id="discLensSeg" role="group" aria-label="Recommendation lens">
+          ${lensButtons.map(([val, lbl]) => `<button type="button" data-disc-lens="${val}" class="${state.discover.lens === val ? 'on' : ''}">${lbl}</button>`).join('')}
+        </div>
+        <label class="genre-wrap disc-anchor-wrap${state.discover.anchor ? ' active' : ''}" title="Focus recommendations around one favorite show or movie">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 2 2.4 6.6L21 11l-6.6 2.4L12 20l-2.4-6.6L3 11l6.6-2.4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+          <select id="discAnchorSelect" aria-label="Because you loved">
+            <option value="">All Taste DNA</option>
+            ${anchors.map((a) => `<option value="${esc(a.key)}"${state.discover.anchor === a.key ? ' selected' : ''}>Like ${esc(a.name)}${a.favorite ? ' ★' : ''}</option>`).join('')}
+          </select>
+        </label>
+      </div>
+
+      ${
+        state.discover.studioOpen
+          ? `<div class="disc-studio" id="discStudioPanel">
+              <div class="disc-studio-head">
+                <h3>Your Local Taste DNA — click any trait to boost or mute</h3>
+                <button id="discResetTraitsBtn" class="mini-text-btn muted-btn" type="button">Reset custom pins</button>
+              </div>
+              <div class="disc-studio-cols">
+                <div class="disc-trait-box">
+                  <div class="disc-trait-title">Strong Affinities (Click to Boost Stronger)</div>
+                  <div class="disc-trait-chips">
+                    ${
+                      (prof.loves || []).length
+                        ? prof.loves
+                            .map((t) => `<button type="button" class="disc-tchip love${t.boosted ? ' boosted' : ''}" data-trait-boost="${esc(t.key)}" title="Score ${t.score}. Click to toggle boost">${esc(t.label)}${t.boosted ? ' ★' : ''}</button>`)
+                            .join('')
+                        : '<span class="muted">Add favorites, watch episodes, or quick-rate below to train affinities.</span>'
+                    }
+                  </div>
+                </div>
+                <div class="disc-trait-box">
+                  <div class="disc-trait-title">Learned Avoidances &amp; Muted Traits (Click to Unmute/Toggle)</div>
+                  <div class="disc-trait-chips">
+                    ${
+                      (prof.avoids || []).length
+                        ? prof.avoids
+                            .map((t) => `<button type="button" class="disc-tchip avoid${t.muted ? ' muted-trait' : ''}" data-trait-mute="${esc(t.key)}" title="Penalty ${t.score}. Click to toggle mute">${esc(t.label)}</button>`)
+                            .join('')
+                        : '<span class="muted">Items you hide or reject sharpen what gets filtered out.</span>'
+                    }
+                  </div>
+                </div>
+              </div>
+            </div>`
+          : ''
+      }
+
+      ${
+        showSeeds
+          ? `<div class="disc-seeds" id="discSeedsBox">
+              <div class="disc-seeds-title">
+                <span>${prof.coldStart ? 'Teach Viuhti in 10 seconds — rate a few titles you know:' : 'Quick Taste Tuner — rate titles to refine your DNA'}</span>
+                ${!prof.coldStart ? '<button id="discCloseSeedsBtn" class="mini-text-btn muted-btn" type="button">Close</button>' : ''}
+              </div>
+              <div class="disc-seeds-grid">
+                ${seeds
+                  .slice(0, 8)
+                  .map(
+                    (s) => `
+                  <div class="disc-seed-card" data-seed-key="${esc(s.key)}">
+                    ${s.poster ? `<img src="${esc(s.poster)}" alt="" loading="lazy" />` : '<div class="ph"></div>'}
+                    <div style="min-width:0">
+                      <div class="disc-seed-name" title="${esc(s.name)}">${esc(s.name)}</div>
+                      <div class="disc-seed-meta">${esc((s.genres || []).slice(0, 2).join(' · ') || s.kind)}${s.rating ? ` · ★ ${s.rating}` : ''}</div>
+                      <div class="disc-seed-btns">
+                        <button type="button" data-seed-act="liked" data-seed-key="${esc(s.key)}">♥ Love</button>
+                        <button type="button" data-seed-act="seen" data-seed-key="${esc(s.key)}">✓ Seen</button>
+                        <button type="button" data-seed-act="dislike" data-seed-key="${esc(s.key)}">× Skip</button>
+                      </div>
+                    </div>
+                  </div>`
+                  )
+                  .join('')}
+              </div>
+            </div>`
+          : ''
+      }
+
+      ${
+        items.length
+          ? `<div class="disc-grid" id="discGrid">
+              ${items
+                .map(
+                  (c) => `
+                <article class="disc-card" tabindex="0" data-disc-key="${esc(c.key)}">
+                  ${c.poster ? `<img class="disc-poster" src="${esc(c.poster)}" alt="" loading="lazy" />` : '<div class="disc-poster ph"></div>'}
+                  <div class="disc-body">
+                    <div class="disc-card-top">
+                      <h3 class="disc-card-title">${esc(c.name)}</h3>
+                      <div class="disc-card-badges">
+                        ${c.primaryOverride ? '<span class="wp-badge primary" title="Strict Primary Override*">★ Primary Override*</span>' : ''}
+                        ${c.fuzzyMatch ? '<span class="wp-badge fuzzy" title="Fuzzy Match from Word Pool">Fuzzy Match</span>' : ''}
+                        <span class="disc-match-pill">${c.matchPct}% Match</span>
+                      </div>
+                    </div>
+                    <div class="disc-card-meta">
+                      <span>${c.kind === 'movie' ? 'Movie' : 'Series'}</span>
+                      ${c.premiered ? `<span>· ${esc(String(c.premiered).slice(0, 4))}</span>` : ''}
+                      ${c.channelName || (c.studios && c.studios[0]) ? `<span>· ${esc(c.channelName || c.studios[0])}</span>` : ''}
+                      ${c.rating ? `<span>· ★ ${c.rating}</span>` : ''}
+                      ${c.status ? `<span>· ${esc(c.status)}</span>` : ''}
+                    </div>
+                    ${
+                      (c.reasons || []).length
+                        ? `<div class="disc-reasons">${c.reasons.slice(0, 3).map((r) => `<div class="disc-reason">${esc(r)}</div>`).join('')}</div>`
+                        : ''
+                    }
+                    ${c.summary ? `<p class="disc-summary">${esc(c.summary)}</p>` : ''}
+                    <div class="disc-card-acts" data-stop>
+                      <button type="button" class="disc-act-btn primary" data-disc-act="track" data-disc-key="${esc(c.key)}">+ Calendar</button>
+                      <button type="button" class="disc-act-btn love" data-disc-act="liked" data-disc-key="${esc(c.key)}" title="Already seen and loved — trains Taste DNA">♥ Loved</button>
+                      <button type="button" class="disc-act-btn seen" data-disc-act="seen" data-disc-key="${esc(c.key)}" title="Already watched — exclude cleanly">✓ Seen</button>
+                      <button type="button" class="disc-act-btn nope" data-disc-act="dislike" data-disc-key="${esc(c.key)}" title="Not my taste — hide &amp; penalize traits">× Not for me</button>
+                      <button type="button" class="disc-act-btn" data-disc-gb="${esc(c.key)}" title="Explore constellation in Graxobolt">⚡ Graxobolt</button>
+                    </div>
+                  </div>
+                </article>`
+                )
+                .join('')}
+            </div>`
+          : `<div class="empty-state" style="margin:8px auto">
+              <h2>${jobRunning ? 'Building your recommendations…' : 'No matching picks in this filter yet'}</h2>
+              <p class="muted">${
+                jobRunning
+                  ? 'Analyzing themes, showrunners, cast, and hidden avoidances locally…'
+                  : 'Try switching lens to Deep Mix, resetting "Because you loved", or clicking Analyze Deeper.'
+              }</p>
+            </div>`
+      }`;
+
+    $('#discWordPoolBtn', view)?.addEventListener('click', () => openDrawer('wordpool'));
+    $('#discStudioBtn', view)?.addEventListener('click', () => {
+      state.discover.studioOpen = !state.discover.studioOpen;
+      renderDiscoverView();
+    });
+    $('#discTunerBtn', view)?.addEventListener('click', () => {
+      state.discover.tunerOpen = !state.discover.tunerOpen;
+      renderDiscoverView();
+    });
+    $('#discCloseSeedsBtn', view)?.addEventListener('click', () => {
+      state.discover.tunerOpen = false;
+      renderDiscoverView();
+    });
+    $('#discRebuildBtn', view)?.addEventListener('click', () => runDiscoverScan(true));
+    $('#discAnchorSelect', view)?.addEventListener('change', (e) => {
+      state.discover.anchor = e.target.value;
+      loadDiscover(false);
+    });
+    $$('[data-disc-media]', view).forEach((b) =>
+      b.addEventListener('click', () => {
+        state.discover.media = b.dataset.discMedia;
+        store.set('discMedia', state.discover.media);
+        loadDiscover(false);
+      })
+    );
+    $$('[data-disc-lens]', view).forEach((b) =>
+      b.addEventListener('click', () => {
+        state.discover.lens = b.dataset.discLens;
+        store.set('discLens', state.discover.lens);
+        loadDiscover(false);
+      })
+    );
+    $('#discResetTraitsBtn', view)?.addEventListener('click', () => {
+      const taste = window.ViuhtiClient.getTaste();
+      taste.overrides = { boost: [], mute: [] };
+      window.ViuhtiClient.saveTaste(taste);
+      if (state.discover.data) {
+        state.discover.data = window.ViuhtiClient.applyToDiscover(
+          rawDiscoverData || state.discover.data,
+          state.shows,
+          state.movies,
+          state.discover.media,
+          state.discover.lens
+        );
+      }
+      renderDiscoverView();
+      toast('Reset Taste DNA trait pins', 'ok');
+    });
+  }
+
+  $('#discoverView')?.addEventListener('click', async (e) => {
+    const boostChip = e.target.closest('[data-trait-boost]');
+    if (boostChip) {
+      toggleDiscoverTrait('boost', boostChip.dataset.traitBoost);
+      return;
+    }
+    const muteChip = e.target.closest('[data-trait-mute]');
+    if (muteChip) {
+      toggleDiscoverTrait('mute', muteChip.dataset.traitMute);
+      return;
+    }
+    const seedAct = e.target.closest('[data-seed-act]');
+    if (seedAct) {
+      const seed = ((state.discover.data && state.discover.data.starterSeeds) || []).find((s) => s.key === seedAct.dataset.seedKey);
+      if (!seed) return;
+      seedAct.disabled = true;
+      await sendDiscoverFeedback({
+        kind: seed.kind,
+        id: seed.tvmazeId || seed.tmdbId,
+        tvmazeId: seed.tvmazeId,
+        tmdbId: seed.tmdbId,
+        action: seedAct.dataset.seedAct,
+        item: seed,
+      });
+      return;
+    }
+    const actBtn = e.target.closest('[data-disc-act]');
+    if (actBtn) {
+      const item = ((state.discover.data && state.discover.data.items) || []).find((x) => x.key === actBtn.dataset.discKey);
+      if (!item) return;
+      actBtn.disabled = true;
+      await sendDiscoverFeedback({
+        kind: item.kind,
+        id: item.tvmazeId || item.tmdbId,
+        tvmazeId: item.tvmazeId,
+        tmdbId: item.tmdbId,
+        imdbId: item.imdbId,
+        action: actBtn.dataset.discAct,
+        item,
+      });
+      return;
+    }
+    const gbBtn = e.target.closest('[data-disc-gb]');
+    if (gbBtn) {
+      const item = ((state.discover.data && state.discover.data.items) || []).find((x) => x.key === gbBtn.dataset.discGb);
+      if (item) {
+        openGraxobolt({
+          seedKind: item.kind,
+          seedId: item.tvmazeId || null,
+          seedTmdbId: item.tmdbId || null,
+          seedName: item.name,
+          imdbId: item.imdbId || null,
+        });
+      }
+      return;
+    }
+    const card = e.target.closest('.disc-card');
+    if (card) {
+      const item = ((state.discover.data && state.discover.data.items) || []).find((x) => x.key === card.dataset.discKey);
+      if (item) openDiscoverModal(item);
+    }
+  });
+  $('#discoverView')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && e.target.matches('.disc-card')) {
+      const item = ((state.discover.data && state.discover.data.items) || []).find((x) => x.key === e.target.dataset.discKey);
+      if (item) openDiscoverModal(item);
+    }
+  });
+
+  function openDiscoverModal(item) {
+    const seq = ++modalSeq;
+    $('.modal-card')?.classList.remove('wide');
+    const heroImg = item.backdrop || item.poster || '';
+    const extHref = item.url || (item.tmdbId ? `https://www.themoviedb.org/${item.kind === 'movie' ? 'movie' : 'tv'}/${item.tmdbId}` : `https://www.tvmaze.com/shows/${item.tvmazeId}`);
+    $('#modalBody').innerHTML = `
+      <div class="m-hero">
+        <div class="m-hero-bg" style="background-image:url('${esc(heroImg)}')"></div>
+        <div class="m-hero-inner">
+          ${item.poster ? `<img class="m-poster" src="${esc(item.poster)}" alt="">` : ''}
+          <div>
+            <h2 class="m-show" id="modalTitle">${esc(item.name)}</h2>
+            <div class="m-ep">${item.matchPct ? `<span class="code">${item.matchPct}% Match</span>` : ''}${item.kind === 'movie' ? 'Movie' : 'Series'}${item.premiered ? ` · ${esc(String(item.premiered).slice(0, 4))}` : ''}</div>
+          </div>
+        </div>
+      </div>
+      <div class="m-content">
+        <div class="m-facts">
+          ${item.channelName || (item.studios && item.studios[0]) ? `<span class="fact">${esc(item.channelName || item.studios[0])}</span>` : ''}
+          ${item.runtime ? `<span class="fact">${ICON.clock}${item.runtime} min</span>` : ''}
+          ${item.rating ? `<span class="fact">${ICON.star}${item.rating}</span>` : ''}
+          ${item.status ? `<span class="fact">${esc(item.status)}</span>` : ''}
+          ${(item.genres || []).map((g) => `<span class="fact">${esc(g)}</span>`).join('')}
+        </div>
+        ${
+          (item.reasons || []).length
+            ? `<div class="disc-reasons" style="margin-bottom:12px">${item.reasons.map((r) => `<div class="disc-reason">${esc(r)}</div>`).join('')}</div>`
+            : ''
+        }
+        ${
+          (item.matchedTraits || []).length
+            ? `<div class="disc-trait-chips" style="margin-bottom:12px">${item.matchedTraits.map((t) => `<button type="button" class="disc-tchip love" data-modal-boost="${esc(t.key)}" title="Click to boost ${esc(t.label)} in your Taste DNA">+ ${esc(t.label)}</button>`).join('')}</div>`
+            : ''
+        }
+        <p class="m-summary">${esc(item.summary || 'No description available.')}</p>
+        <div class="m-actions">
+          <button class="btn" id="discModTrack" type="button">+ Add to Calendar</button>
+          <button class="btn btn-ghost" id="discModGraxobolt" type="button">⚡ Explore in Graxobolt</button>
+          <button class="btn btn-ghost" id="discModLove" type="button">♥ Seen · Loved</button>
+          <button class="btn btn-ghost" id="discModSeen" type="button">✓ Already Seen</button>
+          <button class="btn btn-danger" id="discModNope" type="button">× Not For Me</button>
+          <a class="btn btn-ghost" href="${esc(extHref)}" target="_blank" rel="noopener noreferrer">${ICON.ext} ${item.tmdbId ? 'TMDB' : 'TVmaze'}</a>
+          ${item.imdbUrl ? `<a class="btn btn-ghost" href="${esc(item.imdbUrl)}" target="_blank" rel="noopener noreferrer">${ICON.ext} IMDb</a>` : ''}
+        </div>
+        <div class="m-rich" id="modalRich"></div>
+      </div>`;
+    $('#modal').hidden = false;
+    document.body.style.overflow = 'hidden';
+
+    mountModalRichDetails({
+      kind: item.kind === 'movie' ? 'movie' : 'show',
+      id: item.tvmazeId || item.tmdbId || null,
+      tvmazeId: item.tvmazeId || null,
+      tmdbId: item.tmdbId || null,
+      imdbId: item.imdbId || null,
+      name: item.name,
+      year: String(item.premiered || '').slice(0, 4),
+      existingSummary: item.summary || '',
+      richEl: $('#modalRich'),
+      seq,
+    });
+
+    const actPayload = (action) => ({
+      kind: item.kind,
+      id: item.tvmazeId || item.tmdbId,
+      tvmazeId: item.tvmazeId,
+      tmdbId: item.tmdbId,
+      imdbId: item.imdbId,
+      action,
+      item,
+    });
+    $('#discModTrack').addEventListener('click', async (e) => {
+      const btn = e.currentTarget;
+      btn.disabled = true;
+      btn.textContent = 'Adding…';
+      if (await sendDiscoverFeedback(actPayload('track'))) closeModal();
+      else {
+        btn.disabled = false;
+        btn.textContent = '+ Add to Calendar';
+      }
+    });
+    $('#discModLove').addEventListener('click', async () => {
+      if (await sendDiscoverFeedback(actPayload('liked'))) closeModal();
+    });
+    $('#discModGraxobolt')?.addEventListener('click', () => {
+      closeModal();
+      openGraxobolt({
+        seedKind: item.kind,
+        seedId: item.tvmazeId || null,
+        seedTmdbId: item.tmdbId || null,
+        seedName: item.name,
+        imdbId: item.imdbId || null,
+      });
+    });
+    $('#discModSeen').addEventListener('click', async () => {
+      if (await sendDiscoverFeedback(actPayload('seen'))) closeModal();
+    });
+    $('#discModNope').addEventListener('click', async () => {
+      if (await sendDiscoverFeedback(actPayload('dislike'))) closeModal();
+    });
+    $$('[data-modal-boost]', $('#modalBody')).forEach((b) =>
+      b.addEventListener('click', async () => {
+        if (await toggleDiscoverTrait('boost', b.dataset.modalBoost)) {
+          b.classList.add('boosted');
+          toast(`Boosted "${b.textContent.replace(/^\+\s*/, '')}"`, 'ok');
+        }
+      })
+    );
+    $('.modal-close').focus();
+  }
+
+  // Pause premiere bounce CSS keyframes while actively touching/scrolling so mobile stays compositor-only.
+  let scrollPauseTimer = 0;
+  const markScrolling = () => {
+    const root = document.documentElement;
+    if (!root.classList.contains('is-scrolling')) root.classList.add('is-scrolling');
+    clearTimeout(scrollPauseTimer);
+    scrollPauseTimer = setTimeout(() => root.classList.remove('is-scrolling'), 220);
+  };
+  window.addEventListener('touchstart', markScrolling, { passive: true });
+  window.addEventListener('scroll', markScrolling, { passive: true });
+  window.addEventListener('wheel', markScrolling, { passive: true });
+
+  // Roll over to the new week automatically if the tab is left open.
+  let lastToday = ymd(new Date());
+  setInterval(() => {
+    const t = ymd(new Date());
+    if (t !== lastToday) {
+      lastToday = t;
+      renderCalendar();
+    }
+  }, 60000);
+
+  // ---------- Boot ----------
+  syncMainTabUi();
+  reloadAll().finally(() => {
+    if (state.tab === 'discover') loadDiscover();
+    else if (state.tab === 'graxobolt') openGraxobolt();
+    if (!document.hidden) setTimeout(() => pollStatus(), 600);
+  });
+})();

@@ -1,0 +1,7 @@
+# Copy to .dev.vars for local development (never commit .dev.vars!)
+# Leave APP_PASSPHRASE empty if you want passwordless local dev,
+# or set it to test the passphrase lock screen locally.
+APP_PASSPHRASE=viuhti-local-dev
+SESSION_SECRET=change-me-to-a-long-random-secret-for-local-dev
+# Optional TMDB API key (can also be configured in Settings / Control Center)
+# TMDB_API_KEY=

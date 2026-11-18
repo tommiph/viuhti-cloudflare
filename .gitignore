@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.wrangler/
+.cloudflare/
+.cf/
+.dev.vars
+worker-configuration.d.ts
+*.log
+.DS_Store

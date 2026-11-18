@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Viuhti Cloud · Cache, Quota &amp; Telemetry Dashboard</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <style>
+    :root {
+      --bg: #080b12;
+      --bg-card: rgba(15, 22, 36, 0.86);
+      --bg-soft: rgba(24, 34, 54, 0.68);
+      --border: rgba(148, 163, 184, 0.16);
+      --text: #eef3fb;
+      --muted: #93a4bd;
+      --accent: #f97316;
+      --accent-2: #38bdf8;
+      --ok: #22c55e;
+      --warn: #f59e0b;
+      --bad: #ef4444;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --sans: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: var(--sans);
+      color: var(--text);
+      background:
+        radial-gradient(900px 460px at 12% -8%, rgba(249, 115, 22, 0.16), transparent 60%),
+        radial-gradient(800px 460px at 92% 4%, rgba(56, 189, 248, 0.14), transparent 60%),
+        var(--bg);
+      padding: 24px 18px 48px;
+    }
+    .wrap { max-width: 1220px; margin: 0 auto; }
+    .topbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      margin-bottom: 14px;
+      padding: 16px 20px;
+      border-radius: 16px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      backdrop-filter: blur(12px);
+    }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .dot {
+      width: 12px; height: 12px; border-radius: 999px;
+      background: var(--ok);
+      box-shadow: 0 0 0 5px rgba(34, 197, 94, 0.18);
+      flex-shrink: 0;
+    }
+    .dot.warn { background: var(--warn); box-shadow: 0 0 0 5px rgba(245, 158, 11, 0.2); }
+    .dot.bad { background: var(--bad); box-shadow: 0 0 0 5px rgba(239, 68, 68, 0.2); }
+    h1 { font-size: 1.15rem; margin: 0; letter-spacing: -0.01em; }
+    .sub { font-size: 0.82rem; color: var(--muted); margin-top: 2px; }
+    .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    button, .btn, select {
+      appearance: none;
+      border: 1px solid var(--border);
+      background: var(--bg-soft);
+      color: var(--text);
+      border-radius: 10px;
+      padding: 8px 13px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    button:hover, .btn:hover { border-color: rgba(255,255,255,0.28); }
+    .btn-primary { background: linear-gradient(135deg, #f97316, #ea580c); border-color: transparent; color: #fff; }
+    .btn-primary:disabled, button:disabled { opacity: 0.6; cursor: wait; }
+    .pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 3px 9px; border-radius: 999px;
+      font-size: 0.72rem; font-weight: 700; letter-spacing: 0.02em;
+      background: rgba(34, 197, 94, 0.14); color: #86efac; border: 1px solid rgba(34, 197, 94, 0.28);
+      white-space: nowrap;
+    }
+    .pill.warn { background: rgba(245, 158, 11, 0.14); color: #fcd34d; border-color: rgba(245, 158, 11, 0.28); }
+    .pill.bad { background: rgba(239, 68, 68, 0.14); color: #fca5a5; border-color: rgba(239, 68, 68, 0.28); }
+    .pill.blue { background: rgba(56, 189, 248, 0.13); color: #7dd3fc; border-color: rgba(56, 189, 248, 0.28); }
+    .pill.purple { background: rgba(168, 85, 247, 0.14); color: #d8b4fe; border-color: rgba(168, 85, 247, 0.28); }
+    .banner {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 13px 18px;
+      border-radius: 14px;
+      margin-bottom: 16px;
+      border: 1px solid rgba(34, 197, 94, 0.28);
+      background: rgba(34, 197, 94, 0.08);
+      font-size: 0.86rem;
+    }
+    .banner.warn {
+      border-color: rgba(245, 158, 11, 0.38);
+      background: rgba(245, 158, 11, 0.1);
+    }
+    .banner.bad {
+      border-color: rgba(239, 68, 68, 0.38);
+      background: rgba(239, 68, 68, 0.1);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 15px 16px;
+      backdrop-filter: blur(10px);
+    }
+    .k-label { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+    .k-val { font-size: 1.5rem; font-weight: 750; margin: 6px 0 3px; font-variant-numeric: tabular-nums; }
+    .k-foot { font-size: 0.77rem; color: var(--muted); }
+    .cols { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 14px; margin-bottom: 14px; }
+    .cols-eq { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 14px; }
+    @media (max-width: 960px) { .cols, .cols-eq { grid-template-columns: 1fr; } }
+    h2 { font-size: 0.88rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 12px; }
+    .meter { margin-bottom: 11px; }
+    .meter-head { display: flex; justify-content: space-between; font-size: 0.8rem; margin-bottom: 5px; gap: 8px; }
+    .bar { height: 8px; border-radius: 999px; background: rgba(148, 163, 184, 0.15); overflow: hidden; }
+    .bar > span { display: block; height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--accent-2), var(--accent)); transition: width 0.25s ease; }
+    .tier-strip {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    @media (max-width: 640px) { .tier-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    .tier-box {
+      background: var(--bg-soft);
+      border: 1px solid rgba(148,163,184,0.12);
+      border-radius: 10px;
+      padding: 8px 10px;
+      text-align: center;
+    }
+    .tier-box b { display: block; font-size: 0.68rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    .tier-box span { display: block; font-size: 1.08rem; font-weight: 750; font-family: var(--mono); margin-top: 3px; }
+    .kv-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .kv { background: var(--bg-soft); border-radius: 10px; padding: 9px 11px; border: 1px solid rgba(148,163,184,0.1); }
+    .kv b { display: block; font-size: 0.7rem; color: var(--muted); font-weight: 600; text-transform: uppercase; }
+    .kv span { font-size: 0.85rem; font-weight: 600; font-family: var(--mono); word-break: break-word; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+    th, td { text-align: left; padding: 8px 9px; border-bottom: 1px solid rgba(148, 163, 184, 0.12); }
+    th { color: var(--muted); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    td.mono { font-family: var(--mono); font-size: 0.75rem; }
+    .probe-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 11px; background: var(--bg-soft); border-radius: 10px; margin-bottom: 8px; border: 1px solid rgba(148,163,184,0.1); }
+    .probe-detail { font-family: var(--mono); font-size: 0.75rem; color: var(--muted); }
+    .links { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; font-size: 0.8rem; }
+    .links a { color: var(--accent-2); text-decoration: none; }
+    .links a:hover { text-decoration: underline; }
+    .scroll-tbl { max-height: 290px; overflow: auto; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="topbar">
+      <div class="brand">
+        <span id="statusDot" class="dot"></span>
+        <div>
+          <h1>Viuhti Cloud · Cache, Quota &amp; Telemetry Dashboard</h1>
+          <div id="subline" class="sub">Loading Cloudflare edge, KV cache &amp; D1 status…</div>
+        </div>
+      </div>
+      <div class="actions">
+        <span id="coloPill" class="pill blue">EDGE: —</span>
+        <span id="cachePill" class="pill">CACHE: —</span>
+        <span id="privacyPill" class="pill">PRIVACY: —</span>
+        <select id="pollSel" title="Auto refresh interval">
+          <option value="30000">Auto: 30s</option>
+          <option value="60000" selected>Auto: 60s</option>
+          <option value="120000">Auto: 2m</option>
+          <option value="0">Auto: Off</option>
+        </select>
+        <button id="refreshBtn" title="Bypass edge cache once to read live isolate & KV stats">Refresh Now</button>
+        <button id="probeBtn" class="btn-primary">Run Live Probe</button>
+        <a class="btn" href="/">Open Calendar</a>
+      </div>
+    </header>
+
+    <div id="quotaBanner" class="banner">
+      <div>
+        <strong id="bannerTitle">Checking cache layers and D1 quota state…</strong>
+        <div id="bannerDetail" class="sub" style="margin-top:3px;">Edge Cache → Isolate L1 → Global Workers KV → D1 Origin</div>
+      </div>
+      <span id="bannerPill" class="pill blue">SYNCING</span>
+    </div>
+
+    <section class="grid">
+      <div class="card">
+        <div class="k-label">Cache Hit Ratio</div>
+        <div id="kHitRate" class="k-val">—%</div>
+        <div id="kHitSub" class="k-foot">Requests served with 0 D1 reads</div>
+      </div>
+      <div class="card">
+        <div class="k-label">KV Warm Keys</div>
+        <div id="kKvKeys" class="k-val">—</div>
+        <div id="kKvSub" class="k-foot">Persistent edge fallback</div>
+      </div>
+      <div class="card">
+        <div class="k-label">Tracked Shows</div>
+        <div id="kShows" class="k-val">—</div>
+        <div id="kShowsSub" class="k-foot">Broadcast + Streaming</div>
+      </div>
+      <div class="card">
+        <div class="k-label">Episodes Indexed</div>
+        <div id="kEps" class="k-val">—</div>
+        <div id="kEpsSub" class="k-foot">Multi-week + history</div>
+      </div>
+      <div class="card">
+        <div class="k-label">Tracked Movies</div>
+        <div id="kMovies" class="k-val">—</div>
+        <div id="kMoviesSub" class="k-foot">Keyless digital + catalog</div>
+      </div>
+      <div class="card">
+        <div class="k-label">This / Next Week</div>
+        <div id="kThisWeek" class="k-val">—</div>
+        <div id="kThisWeekSub" class="k-foot">—</div>
+      </div>
+    </section>
+
+    <div class="cols">
+      <section class="card">
+        <h2>4-Tier Cache Pipeline &amp; Free Tier Budgets ($0/mo)</h2>
+        <div class="tier-strip">
+          <div class="tier-box"><b>Edge Hits</b><span id="tEdge">0</span></div>
+          <div class="tier-box"><b>L1 RAM Hits</b><span id="tL1">0</span></div>
+          <div class="tier-box"><b>KV Fresh</b><span id="tKvFresh">0</span></div>
+          <div class="tier-box"><b>KV Stale Shield</b><span id="tKvStale">0</span></div>
+          <div class="tier-box"><b>D1 Origin</b><span id="tD1">0</span></div>
+        </div>
+        <div class="meter">
+          <div class="meter-head"><span>D1 Storage Used</span><span id="mStorageTxt">—</span></div>
+          <div class="bar"><span id="mStorageBar" style="width: 3%"></span></div>
+        </div>
+        <div class="meter">
+          <div class="meter-head"><span>Isolate D1 Reads vs 5M Daily Cap</span><span id="mReadTxt">—</span></div>
+          <div class="bar"><span id="mReadBar" style="width: 1%"></span></div>
+        </div>
+        <div class="meter">
+          <div class="meter-head"><span>Isolate KV Reads / Writes vs Free Cap (100k R / 1k W)</span><span id="mKvTxt">—</span></div>
+          <div class="bar"><span id="mKvBar" style="width: 1%"></span></div>
+        </div>
+        <div class="meter">
+          <div class="meter-head"><span>Autonomous Cron Ticks Today (0 * * * *)</span><span id="mCronTxt">—</span></div>
+          <div class="bar"><span id="mCronBar" style="width: 0%"></span></div>
+        </div>
+        <div class="kv-list">
+          <div class="kv"><b>Platform / Tier</b><span id="vTier">—</span></div>
+          <div class="kv"><b>D1 Query Latency</b><span id="vD1Ms">—</span></div>
+          <div class="kv"><b>Last Request Layer</b><span id="vEdgeCache">—</span></div>
+          <div class="kv"><b>Isolate D1 Totals</b><span id="vIsoD1">—</span></div>
+          <div class="kv"><b>D1 Quota Resets At</b><span id="vQuotaReset">—</span></div>
+          <div class="kv"><b>Est. Cron Daily Reads</b><span id="vCronBudget">—</span></div>
+          <div class="kv"><b>Last Catalog Sync</b><span id="vLastSync">—</span></div>
+          <div class="kv"><b>Last Discovery Run</b><span id="vLastDisc">—</span></div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Live Edge Upstream &amp; DNS Probes</h2>
+        <div id="probeWrap">
+          <div class="sub">Click <b>Run Live Probe</b> to test TVmaze, Wikipedia Films API, IMDb CDN, Cloudflare 1.1.1.1 DoH, and Google 8.8.8.8 DoH directly from this Cloudflare Worker edge node.</div>
+        </div>
+        <h2 style="margin-top: 16px;">Consumer Privacy Isolation</h2>
+        <div class="kv-list">
+          <div class="kv"><b>Personal Show Flags</b><span id="pDirtyShows">—</span></div>
+          <div class="kv"><b>Personal Movie Flags</b><span id="pDirtyMovies">—</span></div>
+          <div class="kv"><b>Watched / Wordpool</b><span id="pWatched">—</span></div>
+          <div class="kv"><b>Discover Pool / Cache</b><span id="pCaches">—</span></div>
+        </div>
+        <div class="links">
+          <a href="/api/health" target="_blank">/api/health</a>
+          <a href="/api/status" target="_blank">/api/status</a>
+          <a href="/api/shows" target="_blank">/api/shows</a>
+          <a href="/api/ops/status" target="_blank">/api/ops/status</a>
+          <a href="/api/calendar.ics" target="_blank">/api/calendar.ics</a>
+        </div>
+      </section>
+    </div>
+
+    <div class="cols-eq">
+      <section class="card">
+        <h2>Shared Public KV Snapshots (viuhti-cache)</h2>
+        <div class="scroll-tbl">
+          <table>
+            <thead>
+              <tr>
+                <th>Cached Route Key</th>
+                <th>State</th>
+                <th>Size</th>
+                <th>Age</th>
+                <th>Source</th>
+              </tr>
+            </thead>
+            <tbody id="kvBody">
+              <tr><td colspan="5" class="sub">Loading KV cache manifest…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Recent Isolate Requests (Admin Telemetry)</h2>
+        <div class="scroll-tbl">
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Route</th>
+                <th>Layer</th>
+                <th>Status</th>
+                <th>D1 R/W</th>
+                <th>Latency</th>
+              </tr>
+            </thead>
+            <tbody id="reqBody">
+              <tr><td colspan="6" class="sub">No API requests traced on this isolate yet.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <section class="card">
+      <h2>Autonomous Cron History (0 * * * *)</h2>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Time (Local)</th>
+              <th>Duration</th>
+              <th>Shows Refreshed</th>
+              <th>Movies Refreshed</th>
+              <th>Discovered</th>
+              <th>Discover Scan</th>
+              <th>D1 Rows (R / W)</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="cronBody">
+            <tr><td colspan="8" class="sub">Waiting for next recorded cron tick…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[c]));
+    const fmtNum = (n) => Number(n || 0).toLocaleString();
+    const fmtAgo = (ts) => {
+      if (!ts) return "Pending";
+      const s = Math.max(0, Math.round((Date.now() - Number(ts)) / 1000));
+      if (s < 60) return `${s}s ago`;
+      if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+      if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+      return `${Math.floor(s / 86400)}d ago`;
+    };
+    const fmtDuration = (sec) => {
+      const s = Math.max(0, Number(sec || 0));
+      const h = Math.floor(s / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      if (h > 0) return `${h}h ${m}m`;
+      if (m > 0) return `${m}m ${s % 60}s`;
+      return `${s}s`;
+    };
+    const fmtBytes = (b) => {
+      if (!b) return "0 B";
+      if (b < 1024) return `${b} B`;
+      if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
+      return `${(b / (1024 * 1024)).toFixed(2)} MB`;
+    };
+    function layerPill(layer) {
+      if (layer === "EDGE-HIT" || layer === "L1-HIT" || layer === "KV-FRESH") return `<span class="pill">${esc(layer)}</span>`;
+      if (layer === "KV-STALE" || layer === "FALLBACK") return `<span class="pill warn">${esc(layer)}</span>`;
+      if (layer === "D1-ORIGIN") return `<span class="pill blue">${esc(layer)}</span>`;
+      return `<span class="pill purple">${esc(layer || "BYPASS")}</span>`;
+    }
+
+    let timer = null;
+    let lastReqHeaders = { edgeCache: "", layer: "", rowsRead: null, rowsWritten: null };
+
+    function renderProbes(probes) {
+      if (!Array.isArray(probes)) return;
+      const html = probes.map((p) => {
+        const badge = p.ok ? `<span class="pill">OK · ${p.ms} ms</span>` : `<span class="pill bad">ERR · ${p.ms} ms</span>`;
+        return `<div class="probe-row">
+          <div>
+            <div style="font-weight:600;font-size:0.84rem;">${esc(p.label)}</div>
+            <div class="probe-detail">${esc(p.detail || "")}</div>
+          </div>
+          ${badge}
+        </div>`;
+      }).join("");
+      $("probeWrap").innerHTML = html || `<div class="sub">No probe results.</div>`;
+    }
+
+    function render(d) {
+      const cat = d.catalog || {};
+      const rt = d.runtime || {};
+      const cron = d.cron || {};
+      const priv = d.privacy || {};
+      const rs = d.resources || {};
+      const q = d.d1Quota || {};
+      const cacheInfo = d.cache || {};
+      const inv = cacheInfo.inventory || { totalKeys: 0, totalBytes: 0, freshKeys: 0, staleKeys: 0, entries: [] };
+
+      const dotCls = q.locked ? "dot warn" : d.ok ? "dot" : "dot bad";
+      $("statusDot").className = dotCls;
+      $("subline").textContent = `${d.origin || location.origin} · Checked ${new Date(d.checkedAt || Date.now()).toLocaleTimeString()}${d.degraded ? " · Snapshot mode" : ""}`;
+      $("coloPill").textContent = `EDGE: ${d.edgeColo || "CF"}`;
+
+      $("cachePill").textContent = cacheInfo.kvEnabled ? `CACHE: ${inv.totalKeys || 0} KV KEYS` : "CACHE: EDGE ONLY";
+      $("cachePill").className = cacheInfo.kvEnabled ? "pill blue" : "pill warn";
+
+      $("privacyPill").textContent = priv.clean ? "PRIVACY: CLEAN" : "PRIVACY: CHECK";
+      $("privacyPill").className = priv.clean ? "pill" : "pill warn";
+
+      const banner = $("quotaBanner");
+      if (q.locked) {
+        banner.className = "banner warn";
+        const resetLocal = q.resetAt ? new Date(q.resetAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "00:00 UTC";
+        $("bannerTitle").textContent = `D1 Daily Read Quota Reached — Serving Traffic from KV Cache Fallback`;
+        $("bannerDetail").textContent = `D1 resets automatically at 00:00 UTC (${resetLocal} local, in ${fmtDuration(q.resetInSec)}). ${inv.totalKeys || 0} cached routes in viuhti-cache keep the app online.`;
+        $("bannerPill").className = "pill warn";
+        $("bannerPill").textContent = `RESET IN ${fmtDuration(q.resetInSec).toUpperCase()}`;
+      } else {
+        banner.className = "banner";
+        $("bannerTitle").textContent = `All Systems Operational — 4-Tier Cache Shielding Cloudflare Free Tier`;
+        $("bannerDetail").textContent = `Edge Cache (3–10m) → Isolate L1 RAM → Persistent KV (${inv.totalKeys || 0} keys / ${fmtBytes(inv.totalBytes)}) → D1 Origin`;
+        $("bannerPill").className = "pill";
+        $("bannerPill").textContent = "D1 HEALTHY";
+      }
+
+      $("kHitRate").textContent = `${rs.cacheHitRatePct ?? 100}%`;
+      $("kHitSub").textContent = `Edge ${fmtNum(rs.edgeCacheHits)} · L1 ${fmtNum(rs.l1CacheHits)} · KV ${fmtNum((rs.kvFreshHits || 0) + (rs.kvStaleHits || 0))}`;
+      $("kKvKeys").textContent = fmtNum(inv.totalKeys || 0);
+      $("kKvSub").textContent = `${fmtNum(inv.freshKeys || 0)} fresh · ${fmtNum(inv.staleKeys || 0)} stale · ${fmtBytes(inv.totalBytes || 0)}`;
+      $("kShows").textContent = fmtNum(cat.shows);
+      $("kEps").textContent = fmtNum(cat.episodes);
+      $("kMovies").textContent = fmtNum(cat.movies);
+
+      const tw = cat.thisWeek || {};
+      const nw = cat.nextWeek || {};
+      $("kThisWeek").textContent = `${fmtNum(tw.episodes)} / ${fmtNum(nw.episodes)} eps`;
+      $("kThisWeekSub").textContent = `This wk ${fmtNum(tw.movies)} mv · Next ${fmtNum(nw.movies)} mv`;
+
+      $("tEdge").textContent = fmtNum(rs.edgeCacheHits || 0);
+      $("tL1").textContent = fmtNum(rs.l1CacheHits || 0);
+      $("tKvFresh").textContent = fmtNum(rs.kvFreshHits || 0);
+      $("tKvStale").textContent = fmtNum(rs.kvStaleHits || 0);
+      $("tD1").textContent = fmtNum(rs.d1OriginHits || 0);
+
+      const sizeBytes = Number(d.d1SizeBytes || 0);
+      const limitBytes = Number(d.d1FreeLimitBytes || 500 * 1024 * 1024);
+      const sizePct = sizeBytes ? Math.min(100, Math.max(1, (sizeBytes / limitBytes) * 100)) : 3;
+      $("mStorageTxt").textContent = sizeBytes ? `${fmtBytes(sizeBytes)} / 500 MB (${sizePct.toFixed(1)}%)` : "Within 500 MB free limit";
+      $("mStorageBar").style.width = `${sizePct}%`;
+
+      const isoRead = Number(rs.isolateRowsRead || 0);
+      const readDailyCap = Number(rs.d1DailyReadLimit || 5_000_000);
+      const readPct = Math.min(100, Math.max(0.5, (isoRead / readDailyCap) * 100));
+      $("mReadTxt").textContent = `${fmtNum(isoRead)} rows this isolate · cap ${fmtNum(readDailyCap)}/day`;
+      $("mReadBar").style.width = `${readPct}%`;
+
+      const kvR = Number(rs.kvReads || 0);
+      const kvW = Number(rs.kvWrites || 0);
+      const kvPct = Math.min(100, Math.max(1, Math.max(kvR / 100_000, kvW / 1_000) * 100));
+      $("mKvTxt").textContent = `${fmtNum(kvR)} R / 100k · ${fmtNum(kvW)} W / 1k`;
+      $("mKvBar").style.width = `${kvPct}%`;
+
+      const runsToday = Number(cron.runsToday || 0);
+      const cronMax = Number(rs.cronMaxPerDay || 24);
+      const cronPct = Math.min(100, Math.round((runsToday / cronMax) * 100));
+      $("mCronTxt").textContent = `${runsToday} / ${cronMax} max/day`;
+      $("mCronBar").style.width = `${cronPct}%`;
+
+      $("vTier").textContent = rt.platform || "CF Workers + D1 + KV";
+      $("vD1Ms").textContent = d.d1LatencyMs != null ? `${d.d1LatencyMs} ms` : (q.locked ? "Quota Locked" : "Cached");
+      $("vEdgeCache").textContent = `${lastReqHeaders.layer || lastReqHeaders.edgeCache || "—"} (${fmtNum(lastReqHeaders.rowsRead ?? rs.sampleRowsRead ?? 0)}R)`;
+      $("vIsoD1").textContent = `${fmtNum(rs.isolateRowsRead)}R / ${fmtNum(rs.isolateRowsWritten)}W (${fmtNum(rs.isolateQueries)}q)`;
+      $("vQuotaReset").textContent = q.resetAt ? `${new Date(q.resetAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} (${fmtDuration(q.resetInSec)})` : "00:00 UTC";
+      $("vCronBudget").textContent = rs.estCronDailyReads != null ? `${fmtNum(rs.estCronDailyReads)}/day (${((rs.estCronDailyReads / readDailyCap) * 100).toFixed(1)}%)` : "Pending next tick";
+      $("vLastSync").textContent = fmtAgo(d.sync?.lastSync);
+      $("vLastDisc").textContent = fmtAgo(d.sync?.lastDiscovery);
+
+      $("pDirtyShows").textContent = String(priv.dirtyShows ?? 0);
+      $("pDirtyMovies").textContent = String(priv.dirtyMovies ?? 0);
+      $("pWatched").textContent = `${priv.watchedItems ?? 0} / ${priv.wordpoolRules ?? 0}`;
+      $("pCaches").textContent = `${fmtNum(cat.tasteItems)} taste · ${fmtNum(cat.wikiCache)}/${fmtNum(cat.itemCache)}`;
+
+      const kvEntries = Array.isArray(inv.entries) ? inv.entries : [];
+      const redactedCount = Number(inv.redactedKeys || 0);
+      $("kvBody").innerHTML = kvEntries.length
+        ? kvEntries.map((k) => {
+            const st = k.fresh ? `<span class="pill">FRESH</span>` : `<span class="pill warn">STALE</span>`;
+            const ttlTxt = k.fresh ? `for ${fmtDuration(Math.max(0, Math.round((k.freshUntil - Date.now()) / 1000)))}` : `${fmtDuration(k.ageSec)} old`;
+            return `<tr>
+              <td class="mono">${esc(k.key)}</td>
+              <td>${st}</td>
+              <td class="mono">${fmtBytes(k.bytes)}</td>
+              <td class="mono">${esc(ttlTxt)}</td>
+              <td class="mono">${esc(k.source)}</td>
+            </tr>`;
+          }).join("") + (redactedCount ? `<tr><td colspan="5" class="sub">${redactedCount} non-catalog key(s) omitted for visitor privacy.</td></tr>` : "")
+        : `<tr><td colspan="5" class="sub">No shared KV cache keys populated yet.</td></tr>`;
+
+      const reqs = Array.isArray(cacheInfo.recentRequests) ? cacheInfo.recentRequests : [];
+      $("reqBody").innerHTML = reqs.length
+        ? reqs.map((r) => `<tr>
+            <td class="mono">${new Date(r.at).toLocaleTimeString()}</td>
+            <td class="mono">${esc(r.method)} ${esc(r.path)}</td>
+            <td>${layerPill(r.layer)}</td>
+            <td class="mono">${r.status}</td>
+            <td class="mono">${fmtNum(r.d1Reads)} / ${fmtNum(r.d1Writes)}</td>
+            <td class="mono">${r.ms} ms</td>
+          </tr>`).join("")
+        : `<tr><td colspan="6" class="sub">${cacheInfo.tracesRedacted ? "Redacted in public mode (recent isolate request logs require admin authorization)." : "No recent requests captured on this isolate yet."}</td></tr>`;
+
+      const hist = Array.isArray(cron.history) ? cron.history : [];
+      if (hist.length) {
+        $("cronBody").innerHTML = hist.map((h) => {
+          const dt = new Date(h.at).toLocaleTimeString();
+          const st = h.ok ? `<span class="pill">OK</span>` : `<span class="pill bad">${esc(h.error || "ERR")}</span>`;
+          const scanTxt = h.tasteCached ? "cached (6h TTL)" : `${h.tasteDone || 0} items`;
+          const d1Txt = h.d1RowsRead != null ? `${fmtNum(h.d1RowsRead)} / ${fmtNum(h.d1RowsWritten || 0)}` : "—";
+          return `<tr>
+            <td class="mono">${dt}</td>
+            <td class="mono">${h.durationMs} ms</td>
+            <td>${h.refreshedShows || 0}</td>
+            <td>${h.refreshedMovies || 0}</td>
+            <td>+${h.addedShows || 0} TV / +${h.addedMovies || 0} Movie</td>
+            <td class="mono">${scanTxt}</td>
+            <td class="mono">${d1Txt}</td>
+            <td>${st}</td>
+          </tr>`;
+        }).join("");
+      }
+
+      if (d.probes) renderProbes(d.probes);
+    }
+
+    async function load({ probe = false, live = false } = {}) {
+      if (probe) {
+        $("probeBtn").disabled = true;
+        $("probeBtn").textContent = "Probing edge…";
+      }
+      if (live) {
+        $("refreshBtn").disabled = true;
+        $("refreshBtn").textContent = "Refreshing…";
+      }
+      try {
+        const params = new URLSearchParams();
+        if (probe) params.set("probe", "1");
+        if (live || probe) params.set("live", "1");
+        const qs = params.toString();
+        const res = await fetch(qs ? `/api/ops/status?${qs}` : "/api/ops/status");
+        lastReqHeaders = {
+          edgeCache: res.headers.get("X-Edge-Cache") || "",
+          layer: res.headers.get("X-Cache-Layer") || "",
+          rowsRead: res.headers.get("X-D1-Rows-Read"),
+          rowsWritten: res.headers.get("X-D1-Rows-Written"),
+        };
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        render(data);
+      } catch (err) {
+        $("statusDot").className = "dot bad";
+        $("subline").textContent = `Error loading telemetry: ${err.message}`;
+      } finally {
+        if (probe) {
+          $("probeBtn").disabled = false;
+          $("probeBtn").textContent = "Run Live Probe";
+        }
+        if (live) {
+          $("refreshBtn").disabled = false;
+          $("refreshBtn").textContent = "Refresh Now";
+        }
+      }
+    }
+
+    function resetTimer() {
+      if (timer) clearInterval(timer);
+      const ms = Number($("pollSel").value || 0);
+      if (ms > 0) timer = setInterval(() => { if (!document.hidden) load(); }, ms);
+    }
+
+    $("pollSel").addEventListener("change", resetTimer);
+    $("refreshBtn").addEventListener("click", () => load({ live: true }));
+    $("probeBtn").addEventListener("click", () => load({ probe: true, live: true }));
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); });
+
+    load({ live: false });
+    resetTimer();
+  </script>
+</body>
+</html>

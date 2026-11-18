@@ -1,0 +1,30 @@
+{
+  "name": "viuhti-cloudflare",
+  "version": "1.0.0",
+  "description": "Viuhti (TV & Movie Calendar + Discover + Graxobolt) on Cloudflare Free Tier (Workers + Static Assets + D1)",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node ./node_modules/wrangler/bin/cf-wrangler.js dev --port 8787",
+    "build": "wrangler build --experimental-new-config --experimental-cf-build-output",
+    "deploy": "npm run build && cf deploy --prebuilt",
+    "typecheck": "tsc --noEmit",
+    "types": "cf workers types",
+    "db:migrate:local": "cf d1 migrations apply viuhti-db --local",
+    "db:migrate:remote": "cf d1 migrations apply YOUR_D1_DATABASE_ID"
+  },
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "d1",
+    "tv-calendar",
+    "viuhti"
+  ],
+  "license": "ISC",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261112.1",
+    "cf": "^0.15.0",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.160.1"
+  }
+}
